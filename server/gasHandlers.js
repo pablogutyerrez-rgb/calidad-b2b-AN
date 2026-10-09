@@ -1,0 +1,3782 @@
+import {
+  deleteSharedRecord,
+  getDatabaseBackend,
+  getEvaluationRecordKey,
+  listSharedKeys,
+  normalizeId,
+  readSharedJson,
+  readSharedRecord,
+  writeSharedRecord
+} from "./database.js";
+import {
+  getFirebaseBlobPlaybackUrl,
+  isFirebaseBlobFile,
+  uploadAttachmentsToRealtimeDatabase
+} from "./fileBlobs.js";
+import {
+  enrichEvaluationWithDirectDriveFolder,
+  isEvaluationAudioFile,
+  isEvaluationImageFile,
+  uploadEvaluationAttachmentsToDrive,
+  validateDriveConnection
+} from "./drive.js";
+import {
+  getFirebaseStoragePlaybackUrl,
+  isFirebaseStorageFile,
+  uploadAttachmentsToFirebaseStorage,
+  validateFirebaseStorageConnection
+} from "./storage.js";
+import {
+  DEFAULT_QUALITY_VARIABLE_CONFIG,
+  calculateQualityVariable,
+  normalizeQualityVariableConfig,
+  validateQualityVariableConfig
+} from "./qualityVariable.js";
+
+const EVALUATIONS_KEY = "evaluations_v1";
+const DELETED_EVALUATIONS_KEY = "deleted_evaluations_v1";
+const COMMUNICATIONS_KEY = "communications_v1";
+const FEEDBACK_KEY = "feedback_records_v2";
+const FEEDBACK_VOLUME_KEY = "feedback_volume_v1";
+const OPERATIONAL_INCIDENTS_KEY = "operational_incidents_v1";
+const SALES_VALIDATIONS_KEY = "sales_validations_v1";
+const COMMERCIAL_DEVELOPMENT_KEY = "commercial_development_v1";
+const CALIBRATION_SESSIONS_KEY = "calibration_sessions";
+const CALIBRATION_PARTICIPANTS_KEY = "calibration_participants";
+const CALIBRATION_EVALUATIONS_KEY = "calibration_evaluations";
+const CALIBRATION_EVALUATION_ITEMS_KEY = "calibration_evaluation_items";
+const CALIBRATION_RESULTS_KEY = "calibration_results";
+const CALIBRATION_COMPARISON_KEY = "calibration_response_comparison";
+const CALIBRATION_ACTIVITY_LOGS_KEY = "calibration_activity_logs";
+const QUALITY_VARIABLE_CONFIG_KEY = "quality_variable_config_v1";
+const QUALITY_VARIABLE_CALCULATIONS_KEY = "quality_variable_calculations_v1";
+const QUALITY_VARIABLE_AUDIT_KEY = "quality_variable_audit_v1";
+const evaluationWriteLocks = new Map();
+let evaluationIndexWriteQueue = Promise.resolve();
+let automaticFeedbackWriteQueue = Promise.resolve();
+const firebaseReadCache = new Map();
+const CACHE_TTL_MS = 15000;
+
+const ROLE_LABELS = {
+  admin: "Administrador",
+  analista: "Analista",
+  supervisor: "Supervisor",
+  coordinador: "Coordinador",
+  formador: "Formador",
+  referente_experto: "Referente Experto",
+  asesor: "Asesor"
+};
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function generateNumericId() {
+  return Date.now() + Math.floor(Math.random() * 1000);
+}
+
+function normalizeDateOrNow(value) {
+  const date = value ? new Date(value) : new Date();
+  return Number.isNaN(date.getTime()) ? nowIso() : date.toISOString();
+}
+
+function normalizeText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/_/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+async function readCachedSharedJson(key, fallback = [], ttlMs = CACHE_TTL_MS) {
+  const now = Date.now();
+  const cached = firebaseReadCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.value;
+  try {
+    const value = await readSharedJson(key, fallback);
+    firebaseReadCache.set(key, { value, expiresAt: now + ttlMs });
+    return value;
+  } catch (error) {
+    if (cached && error?.code === "FIREBASE_QUOTA_EXCEEDED") return cached.value;
+    throw error;
+  }
+}
+
+export function invalidateFirebaseCache(...keys) {
+  const cleanKeys = keys.flat().filter(Boolean).map(String);
+  if (!cleanKeys.length) {
+    firebaseReadCache.clear();
+    return;
+  }
+  cleanKeys.forEach(key => firebaseReadCache.delete(key));
+}
+
+function getRole(user) {
+  const role = normalizeText(user?.rol || user?.role || "");
+  const aliases = {
+    administrador: "admin",
+    administration: "admin",
+    administrator: "admin",
+    monitor: "analista",
+    analyst: "analista",
+    calidad: "analista",
+    quality: "analista",
+    validador: "analista",
+    validator: "analista",
+    trainer: "formador",
+    coach: "formador",
+    advisor: "asesor",
+    sistema: "sistemas",
+    systems: "sistemas"
+  };
+  return aliases[role] || role;
+}
+
+function ensureCurrentUser(user) {
+  if (!user || typeof user !== "object" || !String(user.usuario || "").trim()) {
+    throw new Error("No se pudo validar el usuario actual.");
+  }
+  return user;
+}
+
+function requireRoles(user, roles, message) {
+  const role = getRole(user);
+  if (!roles.includes(role)) throw new Error(message || "No tienes permisos para realizar esta accion.");
+}
+
+function isInactiveUserRecord(user) {
+  return ["cesado", "baja", "inactivo", "inactive", "bloqueado", "disabled", "terminated"].includes(normalizeText(user?.estado || user?.status || "activo"));
+}
+
+async function resolveEvaluationAuditor(payload, currentUser, currentRecord = null) {
+  if (getRole(currentUser) !== "admin") {
+    return currentRecord
+      ? {
+          auditorId: String(currentRecord.auditorId || currentRecord.auditorUsuario || currentUser.usuario || "").trim(),
+          auditorNombre: String(currentRecord.auditorNombre || currentUser.nombre || currentUser.usuario || "").trim()
+        }
+      : {
+          auditorId: String(currentUser.usuario || "").trim(),
+          auditorNombre: String(currentUser.nombre || currentUser.usuario || "").trim()
+        };
+  }
+
+  const requestedId = String(payload.auditorId || payload.auditorUsuario || "").trim();
+  const requestedName = String(payload.auditorNombre || "").trim();
+  if (!requestedId && !requestedName) {
+    return {
+      auditorId: String(currentRecord?.auditorId || currentRecord?.auditorUsuario || currentUser.usuario || "").trim(),
+      auditorNombre: String(currentRecord?.auditorNombre || currentUser.nombre || currentUser.usuario || "").trim()
+    };
+  }
+  const currentAuditorId = String(currentRecord?.auditorId || currentRecord?.auditorUsuario || "").trim();
+  const currentAuditorName = String(currentRecord?.auditorNombre || "").trim();
+  if (currentRecord && (
+    (requestedId && normalizeText(requestedId) === normalizeText(currentAuditorId)) ||
+    (requestedName && (!requestedId || !currentAuditorId) && normalizeText(requestedName) === normalizeText(currentAuditorName))
+  )) {
+    return { auditorId: currentAuditorId, auditorNombre: currentAuditorName };
+  }
+
+  const users = await readCachedSharedJson("users_v1", []);
+  const evaluator = (Array.isArray(users) ? users : []).find(user =>
+    (requestedId && normalizeText(user?.usuario) === normalizeText(requestedId)) ||
+    (requestedName && normalizeText(user?.nombre) === normalizeText(requestedName))
+  );
+  if (!evaluator) throw new Error("El evaluador seleccionado no existe en la gestion de usuarios.");
+  if (isInactiveUserRecord(evaluator)) throw new Error("El evaluador seleccionado se encuentra inactivo.");
+  if (!["admin", "analista", "formador", "supervisor", "coordinador"].includes(getRole(evaluator))) {
+    throw new Error("El usuario seleccionado no tiene un rol habilitado para evaluar.");
+  }
+  return {
+    auditorId: String(evaluator.usuario || requestedId).trim(),
+    auditorNombre: String(evaluator.nombre || evaluator.usuario || requestedName).trim()
+  };
+}
+
+function canManageCommunications(user) {
+  return ["admin", "analista", "supervisor", "formador"].includes(getRole(user));
+}
+
+function canViewSalesValidation(user) {
+  return ["admin", "analista", "supervisor", "formador", "sistemas", "sistema"].includes(getRole(user));
+}
+
+function canManageSalesValidation(user) {
+  return ["admin", "analista"].includes(getRole(user));
+}
+
+function canDeleteSalesValidation(user) {
+  return getRole(user) === "admin";
+}
+
+function canEditOperationalIncident(user) {
+  return ["admin", "analista", "formador"].includes(getRole(user));
+}
+
+function canDeleteOperationalIncident(user) {
+  return getRole(user) === "admin";
+}
+
+function canViewCommercialDevelopment(user) {
+  return ["admin", "analista", "supervisor", "formador"].includes(getRole(user));
+}
+
+function canManageCommercialDevelopment(user) {
+  return ["admin", "analista", "formador"].includes(getRole(user));
+}
+
+function canDeleteCommercialDevelopment(user) {
+  return getRole(user) === "admin";
+}
+
+function getCommunicationAudienceRoles(audienceValue) {
+  const audience = normalizeText(audienceValue);
+  if (audience === "staff") return ["admin", "analista", "supervisor", "formador"];
+  if (audience === "asesores" || audience === "todos") return ["admin", "analista", "supervisor", "formador", "asesor"];
+  return [];
+}
+
+function canUserViewCommunication(user, communication) {
+  return getCommunicationAudienceRoles(communication?.publicoObjetivo).includes(getRole(user));
+}
+
+function isCommunicationExpired(communication) {
+  const value = String(communication?.fechaVencimiento || "").trim();
+  if (!value) return false;
+  const date = new Date(value);
+  return !Number.isNaN(date.getTime()) && date.getTime() < Date.now();
+}
+
+function enrichCommunicationForUser(communication, user) {
+  const userId = normalizeText(user?.usuario || "");
+  const readEntries = Array.isArray(communication?.leidosPor) ? communication.leidosPor : [];
+  const comments = Array.isArray(communication?.comentarios) ? communication.comentarios : [];
+  return {
+    ...communication,
+    isExpired: isCommunicationExpired(communication),
+    readCount: readEntries.length,
+    commentCount: comments.length,
+    userHasRead: readEntries.some(item => normalizeText(item?.usuario) === userId)
+  };
+}
+
+async function readCommunications() {
+  const records = await readCachedSharedJson(COMMUNICATIONS_KEY, []);
+  return Array.isArray(records) ? records : [];
+}
+
+async function writeCommunications(records) {
+  await writeSharedRecord(COMMUNICATIONS_KEY, Array.isArray(records) ? records : []);
+  invalidateFirebaseCache(COMMUNICATIONS_KEY);
+}
+
+function sortCommunications(records) {
+  const priorityOrder = { alta: 3, media: 2, baja: 1 };
+  return records.sort((a, b) => {
+    const pinnedDiff = Number(Boolean(b?.fijado)) - Number(Boolean(a?.fijado));
+    if (pinnedDiff) return pinnedDiff;
+    const priorityDiff = (priorityOrder[normalizeText(b?.prioridad)] || 0) - (priorityOrder[normalizeText(a?.prioridad)] || 0);
+    if (priorityDiff) return priorityDiff;
+    return new Date(b?.fechaPublicacion || b?.fechaCreacion || 0).getTime() - new Date(a?.fechaPublicacion || a?.fechaCreacion || 0).getTime();
+  });
+}
+
+async function findCommunicationFileById(fileId) {
+  const id = String(fileId || "").trim();
+  if (!id) return null;
+  const records = await readCommunications();
+  for (const record of records) {
+    const files = Array.isArray(record?.files) ? record.files : [];
+    const match = files.find(file => String(file?.id || file?.fileId || "").trim() === id);
+    if (match) return match;
+  }
+  return { id, fileId: id, name: "Adjunto de comunicado", mimeType: "application/octet-stream" };
+}
+
+function buildLocalDrivePreview(file) {
+  if (isFirebaseBlobFile(file)) {
+    const blobId = String(file?.blobId || file?.id || "").trim();
+    if (!blobId) throw new Error("El blobId es obligatorio.");
+    const localUrl = getFirebaseBlobPlaybackUrl({ blobId });
+    const mimeType = String(file?.mimeType || "").toLowerCase();
+    const name = String(file?.name || "Adjunto").trim();
+    const isTextFile = mimeType === "text/plain" || /\.txt$/i.test(name);
+    const isAudioFile = mimeType.startsWith("audio/") || /\.(mp3|mpeg|mpga|m4a|wav|ogg|webm)$/i.test(name);
+    const isImageFile = mimeType.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(name);
+    const isPdfFile = mimeType === "application/pdf" || /\.pdf$/i.test(name);
+    return {
+      id: blobId,
+      blobId,
+      storageProvider: "firebase_realtime_database",
+      name,
+      mimeType: file?.mimeType || (isAudioFile ? "audio/mpeg" : isImageFile ? "image/png" : "application/octet-stream"),
+      driveUrl: "",
+      previewUrl: localUrl,
+      downloadUrl: localUrl,
+      downloadDataUrl: "",
+      dataUrl: "",
+      textContent: "",
+      isTextFile,
+      isAudioFile,
+      isImageFile,
+      isPdfFile,
+      hideDriveLink: true
+    };
+  }
+  if (isFirebaseStorageFile(file)) {
+    const storagePath = String(file?.storagePath || file?.id || "").trim();
+    if (!storagePath) throw new Error("El storagePath es obligatorio.");
+    const localUrl = getFirebaseStoragePlaybackUrl({ storagePath });
+    const mimeType = String(file?.mimeType || "").toLowerCase();
+    const name = String(file?.name || "Adjunto").trim();
+    const isTextFile = mimeType === "text/plain" || /\.txt$/i.test(name);
+    const isAudioFile = mimeType.startsWith("audio/") || /\.(mp3|mpeg|mpga|m4a|wav|ogg|webm)$/i.test(name);
+    const isImageFile = mimeType.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(name);
+    const isPdfFile = mimeType === "application/pdf" || /\.pdf$/i.test(name);
+    return {
+      id: storagePath,
+      storagePath,
+      storageProvider: "firebase_storage",
+      name,
+      mimeType: file?.mimeType || (isAudioFile ? "audio/mpeg" : isImageFile ? "image/png" : "application/octet-stream"),
+      driveUrl: "",
+      previewUrl: localUrl,
+      downloadUrl: localUrl,
+      downloadDataUrl: "",
+      dataUrl: "",
+      textContent: "",
+      isTextFile,
+      isAudioFile,
+      isImageFile,
+      isPdfFile,
+      hideDriveLink: true
+    };
+  }
+  const id = String(file?.id || file?.fileId || "").trim();
+  if (!id) throw new Error("El fileId es obligatorio.");
+  const mimeType = String(file?.mimeType || "").toLowerCase();
+  const name = String(file?.name || "Adjunto").trim();
+  const localUrl = `/api/drive/files/${encodeURIComponent(id)}/content`;
+  const isTextFile = mimeType === "text/plain" || /\.txt$/i.test(name);
+  const isAudioFile = mimeType.startsWith("audio/") || /\.(mp3|mpeg|mpga|m4a|wav|ogg|webm)$/i.test(name);
+  const isImageFile = mimeType.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(name);
+  const isPdfFile = mimeType === "application/pdf" || /\.pdf$/i.test(name);
+  return {
+    id,
+    name,
+    mimeType: file?.mimeType || (isAudioFile ? "audio/mpeg" : isImageFile ? "image/png" : "application/octet-stream"),
+    driveUrl: file?.url || file?.driveUrl || `https://drive.google.com/file/d/${id}/view`,
+    previewUrl: localUrl,
+    downloadUrl: localUrl,
+    downloadDataUrl: "",
+    dataUrl: "",
+    textContent: "",
+    isTextFile,
+    isAudioFile,
+    isImageFile,
+    isPdfFile,
+    hideDriveLink: false
+  };
+}
+
+function upsertById(records, record) {
+  const id = normalizeId(record?.id || record?.idEvaluacion);
+  const list = Array.isArray(records) ? records.slice() : [];
+  const index = list.findIndex(item => normalizeId(item?.id || item?.idEvaluacion) === id);
+  if (index >= 0) list[index] = { ...list[index], ...record };
+  else list.unshift(record);
+  return list;
+}
+
+export function buildEvaluationIndexRecord(record = {}) {
+  const compactSections = (Array.isArray(record.secciones) ? record.secciones : []).map(section => ({
+    nombreSeccion: section?.nombreSeccion || section?.subItem || section?.item || section?.criterio || "",
+    resultado: section?.resultado || "",
+    puntaje: section?.puntaje,
+    puntajeReponderado: section?.puntajeReponderado,
+    aporteReponderado: section?.aporteReponderado
+  }));
+  const compactZeroToleranceItems = (Array.isArray(record.zeroToleranceItems) ? record.zeroToleranceItems : []).map(item => ({
+    subItem: item?.subItem || item?.nombreSeccion || item?.item || "",
+    resultado: item?.resultado || "No aplica"
+  }));
+  return {
+    ...(record.isDemo ? {isDemo:true,demoBatch:record.demoBatch} : {}),
+    id: normalizeId(record.id || record.idEvaluacion),
+    idEvaluacion: normalizeId(record.idEvaluacion || record.id),
+    feedbackId: record.feedbackId || "",
+    clientId: record.clientId || record.platformId || DEFAULT_CLIENT_ID,
+    platformId: record.platformId || record.clientId || DEFAULT_CLIENT_ID,
+    clientName: record.clientName || record.platformName || "",
+    platformName: record.platformName || record.clientName || "",
+    asesorNombre: record.asesorNombre || "",
+    auditorId: record.auditorId || record.auditorUsuario || "",
+    auditorNombre: record.auditorNombre || "",
+    campaign: record.campaign || record.managementTypeRuc || record.tipoGestionRuc || "",
+    tipoGestion: record.tipoGestion || "",
+    evaluationFormType: record.evaluationFormType || record.tipoFicha || "venta",
+    tipoFicha: record.tipoFicha || "Venta",
+    evaluationMode: record.evaluationMode || "operacion",
+    isOjt: Boolean(record.isOjt),
+    formadorNombre: record.formadorNombre || "",
+    supervisor: record.supervisor || record.supervisorName || "",
+    coordinador: record.coordinador || record.coordinator || "",
+    fechaEvaluacion: record.fechaEvaluacion || "",
+    estadoEvaluacion: record.estadoEvaluacion || "open",
+    resultadoGeneral: record.resultadoGeneral || "",
+    pesoAplicable: record.pesoAplicable,
+    puntajeLogrado: record.puntajeLogrado,
+    puntajeLogradoBruto: record.puntajeLogradoBruto,
+    appliesCeroTolerancia: Boolean(record.appliesCeroTolerancia),
+    estadoAdjuntos: record.estadoAdjuntos || "",
+    createdAt: record.createdAt || "",
+    updatedAt: record.updatedAt || "",
+    secciones: compactSections,
+    zeroToleranceItems: compactZeroToleranceItems
+  };
+}
+
+function withEvaluationIndexWriteLock(task) {
+  const run = evaluationIndexWriteQueue.then(task, task);
+  evaluationIndexWriteQueue = run.catch(() => {});
+  return run;
+}
+
+async function readFeedbackRecords() {
+  const records = await readCachedSharedJson(FEEDBACK_KEY, []);
+  return Array.isArray(records) ? records : [];
+}
+
+async function writeFeedbackRecords(records) {
+  await writeSharedRecord(FEEDBACK_KEY, Array.isArray(records) ? records : []);
+  invalidateFirebaseCache(FEEDBACK_KEY);
+}
+
+async function readFeedbackVolumeRecords() {
+  const records = await readCachedSharedJson(FEEDBACK_VOLUME_KEY, []);
+  return Array.isArray(records) ? records : [];
+}
+
+async function writeFeedbackVolumeRecords(records) {
+  await writeSharedRecord(FEEDBACK_VOLUME_KEY, Array.isArray(records) ? records : []);
+  invalidateFirebaseCache(FEEDBACK_VOLUME_KEY);
+}
+
+function sortFeedbackRecords(records) {
+  return records.sort((a, b) => (
+    new Date(b?.feedbackDate || b?.updatedAt || b?.createdAt || 0).getTime() -
+    new Date(a?.feedbackDate || a?.updatedAt || a?.createdAt || 0).getTime()
+  ));
+}
+
+async function findFeedbackFileById(fileId) {
+  const id = String(fileId || "").trim();
+  if (!id) return null;
+  const records = await readFeedbackRecords();
+  for (const record of records) {
+    const files = Array.isArray(record?.files) ? record.files : [];
+    const match = files.find(file => String(file?.id || file?.fileId || "").trim() === id);
+    if (match) return match;
+  }
+  return { id, fileId: id, name: "Adjunto de feedback", mimeType: "application/octet-stream" };
+}
+
+function appendFeedbackThreadMessage(record, message) {
+  if (!Array.isArray(record.messages)) record.messages = [];
+  record.messages.push({
+    id: generateNumericId(),
+    text: String(message?.text || "").trim(),
+    authorName: String(message?.authorName || "").trim(),
+    authorUser: String(message?.authorUser || "").trim(),
+    authorRole: String(message?.authorRole || "").trim(),
+    createdAt: nowIso()
+  });
+}
+
+function normalizeFeedbackStatusForSave(advisorUser) {
+  return String(advisorUser || "").trim() ? "pending" : "unassigned";
+}
+
+function canManageFeedback(user) {
+  return ["admin", "analista", "formador", "supervisor", "coordinador"].includes(getRole(user));
+}
+
+function isFeedbackOwner(record, user) {
+  const userKey = normalizeText(user?.usuario);
+  const userName = normalizeText(user?.nombre);
+  return [record?.authorUser, record?.auditorId, record?.createdBy]
+    .some(value => userKey && normalizeText(value) === userKey) ||
+    [record?.authorName, record?.auditorNombre]
+      .some(value => userName && normalizeText(value) === userName);
+}
+
+export function getAutomaticFeedbackFlowStatus(record = {}) {
+  if (!record?.automaticFromEvaluation) {
+    return String(record?.managementStatus || record?.estado || record?.status || "").trim();
+  }
+  const values = [record.managementStatus, record.estado, record.status]
+    .map(value => String(value || "").trim().toLowerCase());
+  if (values.includes("closed_unmanaged")) return "closed_unmanaged";
+  if (values.some(value => ["feedback_completed", "realized"].includes(value))) return "feedback_completed";
+  const advisorDecision = String(record.advisorValidationStatus || record.advisorDecision || "").trim().toLowerCase();
+  if (values.some(value => ["advisor_accepted", "accepted"].includes(value)) || advisorDecision === "accepted" || record.advisorAcceptedAt) {
+    return "advisor_accepted";
+  }
+  return "pending_feedback";
+}
+
+export function shouldCreateAutomaticFeedback(evaluation, currentUser) {
+  const role = getRole(currentUser);
+  const clientId = normalizeClientId(evaluation?.clientId || evaluation?.platformId);
+  return clientId === DEFAULT_CLIENT_ID && ["admin", "analista", "supervisor", "coordinador"].includes(role);
+}
+
+export function isAutomaticFeedbackBlockedForUser(currentUser, users = []) {
+  const userKey = normalizeText(currentUser?.usuario || currentUser?.user || currentUser?.username);
+  if (!userKey) return false;
+  return (Array.isArray(users) ? users : []).some(user => {
+    const candidateKey = normalizeText(user?.usuario || user?.user || user?.username);
+    if (!candidateKey || candidateKey !== userKey) return false;
+    return user.feedbacksBlocked === true || ["true", "1", "si", "yes"].includes(normalizeText(user.feedbacksBlocked));
+  });
+}
+
+export function completeAutomaticFeedback(record, currentUser, completedAt = nowIso()) {
+  if (!record?.automaticFromEvaluation) throw new Error("Solo los feedbacks automaticos admiten esta gestion.");
+  if (getAutomaticFeedbackFlowStatus(record) !== "advisor_accepted") {
+    throw new Error("El asesor debe registrar y aceptar su compromiso antes de finalizar el feedback.");
+  }
+  return {
+    ...record,
+    managementStatus: "feedback_completed",
+    status: "feedback_completed",
+    estado: "feedback_completed",
+    managedAt: completedAt,
+    managedBy: String(currentUser?.usuario || "").trim(),
+    managedByName: String(currentUser?.nombre || currentUser?.usuario || "").trim()
+  };
+}
+
+export function applyAutomaticFeedbackSla(records, nowMs = Date.now()) {
+  let changed = false;
+  const nextRecords = (Array.isArray(records) ? records : []).map(record => {
+    const flowStatus = getAutomaticFeedbackFlowStatus(record);
+    if (!record?.automaticFromEvaluation || !["pending_feedback", "advisor_accepted"].includes(flowStatus)) return record;
+    const createdMs = new Date(record.createdAt || record.feedbackDate || 0).getTime();
+    if (!Number.isFinite(createdMs) || nowMs - createdMs < 24 * 60 * 60 * 1000) return record;
+    changed = true;
+    return {
+      ...record,
+      managementStatus: "closed_unmanaged",
+      status: "closed_unmanaged",
+      estado: "closed_unmanaged",
+      closedWithoutManagementAt: new Date(createdMs + 24 * 60 * 60 * 1000).toISOString(),
+      updatedAt: new Date(nowMs).toISOString()
+    };
+  });
+  return { records: nextRecords, changed };
+}
+
+export function buildAutomaticFeedbackRecord({ evaluation, currentUser, role, clientId, evaluationId, existing = null, now, id }) {
+  const assessor = String(evaluation?.asesorNombre || "").trim().toUpperCase();
+  const flowStatus = existing ? getAutomaticFeedbackFlowStatus(existing) : "pending_feedback";
+  return {
+    ...(existing || {}),
+    id: existing?.id || id,
+    automaticFromEvaluation: true,
+    sourceEvaluationId: evaluationId,
+    evaluationId,
+    clientId,
+    platformId: clientId,
+    asesorId: String(evaluation?.asesorId || evaluation?.advisorUser || assessor).trim(),
+    advisorUser: String(evaluation?.advisorUser || "").trim(),
+    assessor,
+    asesorNombre: assessor,
+    auditorId: String(evaluation?.auditorId || currentUser.usuario || "").trim(),
+    auditorNombre: String(evaluation?.auditorNombre || currentUser.nombre || currentUser.usuario || "").trim(),
+    authorUser: String(evaluation?.auditorId || currentUser.usuario || "").trim(),
+    authorName: String(evaluation?.auditorNombre || currentUser.nombre || currentUser.usuario || "").trim(),
+    authorRole: ROLE_LABELS[role] || role,
+    supervisor: String(evaluation?.supervisor || evaluation?.supervisorName || "").trim(),
+    supervisorName: String(evaluation?.supervisorName || evaluation?.supervisor || "").trim(),
+    coordinador: String(evaluation?.coordinador || evaluation?.coordinator || "").trim(),
+    tipoGestion: "Feedback",
+    feedbackCategory: "Feedback",
+    clasificacionFeedback: String(evaluation?.clasificacionFeedback || "Feedback inicial").trim(),
+    campaign: String(evaluation?.campaign || evaluation?.tipoGestionRuc || "").trim(),
+    resultadoGeneral: String(evaluation?.resultadoGeneral || "").trim(),
+    observacionGeneral: String(evaluation?.observacionGeneral || evaluation?.detalleAuditadoGeneral || evaluation?.detalleAuditado || "").trim(),
+    feedbackText: String(evaluation?.oportunidadMejoraGeneral || evaluation?.oportunidadMejora || evaluation?.observacionGeneral || "").trim(),
+    compromisoMejora: String(evaluation?.compromisoMejora || "").trim(),
+    feedbackDate: existing?.feedbackDate || evaluation?.fechaEvaluacion || now,
+    managementStatus: flowStatus,
+    status: flowStatus,
+    estado: flowStatus,
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+    updatedBy: String(currentUser.usuario || "").trim()
+  };
+}
+
+async function ensureAutomaticFeedbackForEvaluation(evaluation, currentUser) {
+  const role = getRole(currentUser);
+  const clientId = normalizeClientId(evaluation?.clientId || evaluation?.platformId);
+  if (!shouldCreateAutomaticFeedback(evaluation, currentUser)) return null;
+  const users = await readCachedSharedJson("users_v1", []);
+  if (isAutomaticFeedbackBlockedForUser(currentUser, users)) return null;
+
+  const evaluationId = normalizeId(evaluation?.idEvaluacion || evaluation?.id);
+  if (!evaluationId) return null;
+  const task = async () => {
+    const records = await readFeedbackRecords();
+    const existingIndex = records.findIndex(record =>
+      record?.automaticFromEvaluation && normalizeId(record?.sourceEvaluationId || record?.evaluationId) === evaluationId
+    );
+    const existing = existingIndex >= 0 ? records[existingIndex] : null;
+    const record = buildAutomaticFeedbackRecord({evaluation,currentUser,role,clientId,evaluationId,existing,now:nowIso(),id:generateNumericId()});
+  if (existingIndex >= 0) records[existingIndex] = record;
+  else records.unshift(record);
+  await writeFeedbackRecords(records);
+  return record;
+  };
+  const run = automaticFeedbackWriteQueue.then(task, task);
+  automaticFeedbackWriteQueue = run.catch(() => {});
+  return run;
+}
+
+export function buildFeedbackVolumeRecords({ operationalRecords, existingRecords = [], quantity, monitor, monitorUser, feedbackDate, month, clientId, clientName, createdBy, now, batchId }) {
+  const sources = Array.isArray(operationalRecords) ? operationalRecords : [];
+  if (!sources.length) return [];
+  const startMs = new Date(`${feedbackDate}T08:00:00-05:00`).getTime();
+  const availableMinutes = 600;
+  const occupiedMinutes = new Set((Array.isArray(existingRecords) ? existingRecords : []).map(record => {
+    const time = new Date(record?.feedbackDate || record?.createdAt || "").getTime();
+    return Number.isFinite(time) ? Math.floor(time / 60000) * 60000 : null;
+  }).filter(time => time !== null));
+  const availableSlots = Array.from({length:availableMinutes}, (_, index) => startMs + index * 60000)
+    .filter(time => !occupiedMinutes.has(time));
+  if (quantity > availableSlots.length) {
+    throw new Error(`Solo quedan ${availableSlots.length} horarios disponibles para la fecha seleccionada.`);
+  }
+  return Array.from({length:quantity}, (_, index) => {
+    const source = sources[index % sources.length];
+    const copy = typeof structuredClone === "function" ? structuredClone(source) : JSON.parse(JSON.stringify(source));
+    const slotIndex = quantity === 1 ? 0 : Math.floor((index * (availableSlots.length - 1)) / (quantity - 1));
+    const generatedDate = new Date(availableSlots[slotIndex]).toISOString();
+    return withClientScope({
+      ...copy,
+      id: `${batchId}_${index + 1}`,
+      batchId,
+      sourceFeedbackId: source.id || "",
+      recordType: "feedback_volume",
+      copySchemaVersion: 2,
+      isStatistical: true,
+      statisticalOnly: true,
+      operational: false,
+      workflowEnabled: false,
+      advisorVisible: false,
+      generatesCommitments: false,
+      generatesTasks: false,
+      generatesAlerts: false,
+      affectsEvaluations: false,
+      auditorId: monitorUser,
+      auditorNombre: String(monitor.nombre || monitorUser).trim(),
+      authorUser: monitorUser,
+      authorName: String(monitor.nombre || monitorUser).trim(),
+      authorRole: ROLE_LABELS.analista,
+      feedbackDate: generatedDate,
+      statisticalMonth: month,
+      status: String(source.status || source.estado || "pending").trim(),
+      estado: String(source.estado || source.status || "pending").trim(),
+      createdAt: generatedDate,
+      updatedAt: now,
+      createdBy
+    }, clientId, clientName || "");
+  });
+}
+
+function hydrateLegacyFeedbackVolumeRecord(record, operationalRecords) {
+  if (Number(record?.copySchemaVersion) >= 2) return record;
+  const source = (operationalRecords || []).find(item => String(item?.id || "") === String(record?.sourceFeedbackId || ""));
+  if (!source) {
+    return {...record,status:"pending",estado:"pending"};
+  }
+  return {
+    ...(typeof structuredClone === "function" ? structuredClone(source) : JSON.parse(JSON.stringify(source))),
+    id: record.id,
+    batchId: record.batchId,
+    sourceFeedbackId: record.sourceFeedbackId,
+    recordType: "feedback_volume",
+    copySchemaVersion: 2,
+    isStatistical: true,
+    statisticalOnly: true,
+    operational: false,
+    workflowEnabled: false,
+    advisorVisible: false,
+    generatesCommitments: false,
+    generatesTasks: false,
+    generatesAlerts: false,
+    affectsEvaluations: false,
+    auditorId: record.auditorId,
+    auditorNombre: record.auditorNombre,
+    authorUser: record.authorUser,
+    authorName: record.authorName,
+    authorRole: record.authorRole,
+    feedbackDate: record.feedbackDate,
+    statisticalMonth: record.statisticalMonth,
+    status: String(source.status || source.estado || "pending").trim(),
+    estado: String(source.estado || source.status || "pending").trim(),
+    createdAt: record.createdAt || record.feedbackDate,
+    updatedAt: record.updatedAt,
+    createdBy: record.createdBy
+  };
+}
+
+function isFeedbackAdvisorValidated(record = {}) {
+  const validation = normalizeText(record.advisorValidationStatus || record.advisorDecision || "");
+  const status = normalizeText(record.estado || record.status || "");
+  if (status === "in follow up" || status === "in_follow_up") return false;
+  return ["accepted", "rejected", "advisor accepted", "advisor rejected", "advisor_accepted", "advisor_rejected"].includes(validation) ||
+    ["accepted", "rejected", "advisor accepted", "advisor rejected", "advisor_accepted", "advisor_rejected"].includes(status) ||
+    !!record.advisorValidatedAt ||
+    !!record.advisorAcceptedAt;
+}
+
+function isFeedbackAssignedToSupervisor(record = {}, user = {}) {
+  const assignedUser = String(record.supervisorUser || record.supervisorId || "").trim();
+  if (assignedUser) return normalizeText(assignedUser) === normalizeText(user.usuario);
+  const assignedName = String(record.supervisorName || record.supervisor || "").trim();
+  if (!assignedName) return true;
+  const userKeys = [user.nombre, user.usuario, user.assessorName].map(normalizeText).filter(Boolean);
+  const assignedKey = normalizeText(assignedName);
+  return userKeys.some(key => key === assignedKey || (key.length > 6 && assignedKey.length > 6 && (key.includes(assignedKey) || assignedKey.includes(key))));
+}
+
+function sanitizeRuntimePayload(payload = {}) {
+  const { attachments, currentUser, attachment, attachmentMetadata, ...rest } = payload;
+  return rest;
+}
+
+const EVALUATION_FORM_TYPES = {
+  venta: { label: "Venta" },
+  no_venta: { label: "No venta" },
+  mala_practica: { label: "Mala practica" }
+};
+
+const DEFAULT_CLIENT_ID = "entel_b2b";
+const CULQI_CLIENT_ID = "culqi_bcp";
+const COMMERCIAL_DEVELOPMENT_CLIENT_ID = "desarrollo_comercial";
+
+const EVALUATION_FORM_TEMPLATES = {
+  venta: [
+    { categoria: "1. Conecta: Entrada y Validacion", pesoItem: 5, nombreSeccion: "1.1 Saludo e Identificacion", criterio: "Saludo e identificacion", pesoSub: 2 },
+    { categoria: "1. Conecta: Entrada y Validacion", pesoItem: 5, nombreSeccion: "1.2 Validacion del Titular o Decisor", criterio: "Validacion del titular o decisor", pesoSub: 3 },
+    { categoria: "2. Diagnostica: Diagnostico Comercial", pesoItem: 10, nombreSeccion: "2.1 Sondeo estrategico", criterio: "Sondeo estrategico", pesoSub: 10 },
+    { categoria: "3. Construye Valor: Presentacion de la Oferta", pesoItem: 20, nombreSeccion: "3.1 Presentacion de la Oferta", criterio: "Presentacion de la oferta", pesoSub: 6 },
+    { categoria: "3. Construye Valor: Presentacion de la Oferta", pesoItem: 20, nombreSeccion: "3.2 Plan, Beneficios e IGV", criterio: "Plan, beneficios e IGV", pesoSub: 10 },
+    { categoria: "3. Construye Valor: Presentacion de la Oferta", pesoItem: 20, nombreSeccion: "3.3 Entrega, Portabilidad y Plazos", criterio: "Entrega, portabilidad y plazos", pesoSub: 4 },
+    { categoria: "4. Experiencia del Cliente", pesoItem: 10, nombreSeccion: "4.1 Manejo de objeciones", criterio: "Manejo de objeciones", pesoSub: 10 },
+    { categoria: "5. Formaliza: Contratacion Telefonica", pesoItem: 35, nombreSeccion: "5.1 Validaciones y Numero a Portar", criterio: "Validaciones y numero a portar", pesoSub: 10 },
+    { categoria: "5. Formaliza: Contratacion Telefonica", pesoItem: 35, nombreSeccion: "5.2 Lectura de Contrato y Confirmacion Grabada", criterio: "Lectura de contrato y confirmacion grabada", pesoSub: 15 },
+    { categoria: "5. Formaliza: Contratacion Telefonica", pesoItem: 35, nombreSeccion: "5.3 Informacion de Portabilidad y Activacion", criterio: "Informacion de portabilidad y activacion", pesoSub: 10 },
+    { categoria: "6. Fideliza: Cierre y Tipificacion", pesoItem: 10, nombreSeccion: "6.1 Cierre de ventas", criterio: "Cierre de ventas", pesoSub: 5 },
+    { categoria: "6. Fideliza: Cierre y Tipificacion", pesoItem: 10, nombreSeccion: "6.2 Tipificacion y sistemas", criterio: "Tipificacion y sistemas", pesoSub: 5 },
+    { categoria: "7. Estandar Transversal: Experiencia del Cliente", pesoItem: 10, nombreSeccion: "7.1 Escucha activa y empatia", criterio: "Escucha activa y empatia", pesoSub: 5 },
+    { categoria: "7. Estandar Transversal: Experiencia del Cliente", pesoItem: 10, nombreSeccion: "7.2 Tono Profesional y Claridad", criterio: "Tono profesional y claridad", pesoSub: 5 }
+  ],
+  no_venta: [
+    { categoria: "1. Conecta: Entrada y Validacion", pesoItem: 10, nombreSeccion: "1.1 Saludo e Identificacion", criterio: "Saludo e identificacion", pesoSub: 4 },
+    { categoria: "1. Conecta: Entrada y Validacion", pesoItem: 10, nombreSeccion: "1.2 Validacion del Titular o Decisor", criterio: "Validacion del titular o decisor", pesoSub: 6 },
+    { categoria: "2. Diagnostica: Diagnostico Comercial", pesoItem: 20, nombreSeccion: "2.1 Sondeo estrategico", criterio: "Sondeo estrategico", pesoSub: 20 },
+    { categoria: "3. Construye Valor: Presentacion de la Oferta", pesoItem: 25, nombreSeccion: "3.1 Presentacion de la Oferta", criterio: "Presentacion de la oferta", pesoSub: 8 },
+    { categoria: "3. Construye Valor: Presentacion de la Oferta", pesoItem: 25, nombreSeccion: "3.2 Plan, Beneficios e IGV", criterio: "Plan, beneficios e IGV", pesoSub: 12 },
+    { categoria: "3. Construye Valor: Presentacion de la Oferta", pesoItem: 25, nombreSeccion: "3.3 Entrega, Portabilidad y Plazos", criterio: "Entrega, portabilidad y plazos", pesoSub: 5 },
+    { categoria: "4. Experiencia del Cliente", pesoItem: 25, nombreSeccion: "4.1 Manejo de objeciones", criterio: "Manejo de objeciones", pesoSub: 25 },
+    { categoria: "5. Formaliza: Contratacion Telefonica", pesoItem: 0, nombreSeccion: "5.1 Validaciones y Numero a Portar", criterio: "Validaciones y numero a portar", pesoSub: 0 },
+    { categoria: "5. Formaliza: Contratacion Telefonica", pesoItem: 0, nombreSeccion: "5.2 Lectura de Contrato y Confirmacion Grabada", criterio: "Lectura de contrato y confirmacion grabada", pesoSub: 0 },
+    { categoria: "5. Formaliza: Contratacion Telefonica", pesoItem: 0, nombreSeccion: "5.3 Informacion de Portabilidad y Activacion", criterio: "Informacion de portabilidad y activacion", pesoSub: 0 },
+    { categoria: "6. Fideliza: Cierre y Tipificacion", pesoItem: 10, nombreSeccion: "6.1 Cierre de ventas", criterio: "Cierre de ventas", pesoSub: 5 },
+    { categoria: "6. Fideliza: Cierre y Tipificacion", pesoItem: 10, nombreSeccion: "6.2 Tipificacion y sistemas", criterio: "Tipificacion y sistemas", pesoSub: 5 },
+    { categoria: "7. Estandar Transversal: Experiencia del Cliente", pesoItem: 10, nombreSeccion: "7.1 Escucha activa y empatia", criterio: "Escucha activa y empatia", pesoSub: 5 },
+    { categoria: "7. Estandar Transversal: Experiencia del Cliente", pesoItem: 10, nombreSeccion: "7.2 Tono Profesional y Claridad", criterio: "Tono profesional y claridad", pesoSub: 5 }
+  ],
+  mala_practica: []
+};
+
+const CULQI_EVALUATION_FORM_TEMPLATES = {
+  venta: [
+    { categoria: "1. Apertura y Validacion", pesoItem: 20, nombreSeccion: "1.1 Presentacion y Grabacion", criterio: "Presentacion y grabacion", pesoSub: 10 },
+    { categoria: "1. Apertura y Validacion", pesoItem: 20, nombreSeccion: "1.2 Validacion y Autoridad", criterio: "Validacion y autoridad", pesoSub: 10 },
+    { categoria: "2. Propuesta del Producto", pesoItem: 15, nombreSeccion: "2.1 Explicacion Funcional", criterio: "Explicacion funcional", pesoSub: 10 },
+    { categoria: "2. Propuesta del Producto", pesoItem: 15, nombreSeccion: "2.2 Beneficios Reales", criterio: "Beneficios reales", pesoSub: 5 },
+    { categoria: "3. Condiciones Economicas", pesoItem: 25, nombreSeccion: "3.1 Tasas y cobro de IGV", criterio: "Tasas y cobro de IGV", pesoSub: 15 },
+    { categoria: "3. Condiciones Economicas", pesoItem: 25, nombreSeccion: "3.2 Costos y Membresias", criterio: "Costos y membresias", pesoSub: 10 },
+    { categoria: "4. Politicas de Uso", pesoItem: 20, nombreSeccion: "4.1 Facturacion Minima (GPV)", criterio: "Facturacion minima GPV", pesoSub: 10 },
+    { categoria: "4. Politicas de Uso", pesoItem: 20, nombreSeccion: "4.2 Condiciones de Recojo", criterio: "Condiciones de recojo", pesoSub: 10 },
+    { categoria: "5. Cierre de Venta", pesoItem: 15, nombreSeccion: "5.1 Resumen y Aceptacion", criterio: "Resumen y aceptacion", pesoSub: 10 },
+    { categoria: "5. Cierre de Venta", pesoItem: 15, nombreSeccion: "5.2 Datos para Visita/Envio", criterio: "Datos para visita o envio", pesoSub: 5 },
+    { categoria: "6. Gestion y Trato", pesoItem: 5, nombreSeccion: "6.1 Resolucion de Dudas", criterio: "Resolucion de dudas", pesoSub: 2.5 },
+    { categoria: "6. Gestion y Trato", pesoItem: 5, nombreSeccion: "6.2 Trato y Tipificacion", criterio: "Trato y tipificacion", pesoSub: 2.5 }
+  ],
+  no_venta: [
+    { categoria: "1. Protocolo de Inicio", pesoItem: 15, nombreSeccion: "1.1 Presentacion y Motivo", criterio: "Presentacion y motivo", pesoSub: 10 },
+    { categoria: "1. Protocolo de Inicio", pesoItem: 15, nombreSeccion: "1.2 Trato e Interes Inicial", criterio: "Trato e interes inicial", pesoSub: 5 },
+    { categoria: "2. Sondeo Comercial", pesoItem: 20, nombreSeccion: "2.1 Indagacion del Negocio", criterio: "Indagacion del negocio", pesoSub: 10 },
+    { categoria: "2. Sondeo Comercial", pesoItem: 20, nombreSeccion: "2.2 Sondeo Estrategico", criterio: "Sondeo estrategico", pesoSub: 10 },
+    { categoria: "3. Presentacion de Oferta", pesoItem: 20, nombreSeccion: "3.1 Explicacion del POS", criterio: "Explicacion del POS", pesoSub: 10 },
+    { categoria: "3. Presentacion de Oferta", pesoItem: 20, nombreSeccion: "3.2 Transparencia", criterio: "Transparencia", pesoSub: 10 },
+    { categoria: "4. Manejo de Objeciones", pesoItem: 30, nombreSeccion: "4.1 Escucha de la Objecion", criterio: "Escucha de la objecion", pesoSub: 15 },
+    { categoria: "4. Manejo de Objeciones", pesoItem: 30, nombreSeccion: "4.2 Rebate / Argumentacion", criterio: "Rebate / argumentacion", pesoSub: 15 },
+    { categoria: "5. Cierre y Despedida", pesoItem: 10, nombreSeccion: "5.1 Alternativa de Seguimiento", criterio: "Alternativa de seguimiento", pesoSub: 5 },
+    { categoria: "5. Cierre y Despedida", pesoItem: 10, nombreSeccion: "5.2 Cierre Cordial", criterio: "Cierre cordial", pesoSub: 5 },
+    { categoria: "6. Gestion del Sistema", pesoItem: 5, nombreSeccion: "6.1 Tipificacion", criterio: "Tipificacion", pesoSub: 2.5 },
+    { categoria: "6. Gestion del Sistema", pesoItem: 5, nombreSeccion: "6.2 Registro de Comentarios", criterio: "Registro de comentarios", pesoSub: 2.5 }
+  ],
+  mala_practica: []
+};
+
+const EVALUATION_FORM_TEMPLATES_BY_CLIENT = {
+  [DEFAULT_CLIENT_ID]: EVALUATION_FORM_TEMPLATES,
+  [CULQI_CLIENT_ID]: CULQI_EVALUATION_FORM_TEMPLATES
+};
+
+function normalizeClientId(value) {
+  const raw = String(value || DEFAULT_CLIENT_ID).trim();
+  if (raw === CULQI_CLIENT_ID) return CULQI_CLIENT_ID;
+  if (raw === COMMERCIAL_DEVELOPMENT_CLIENT_ID) return COMMERCIAL_DEVELOPMENT_CLIENT_ID;
+  return DEFAULT_CLIENT_ID;
+}
+
+function getEvaluationTemplatesForClient(clientId) {
+  return EVALUATION_FORM_TEMPLATES_BY_CLIENT[normalizeClientId(clientId)] || EVALUATION_FORM_TEMPLATES;
+}
+
+function normalizeEvaluationFormType(value) {
+  const normalized = normalizeText(value);
+  if (["no venta", "no_venta", "noventa"].includes(normalized)) return "no_venta";
+  if (["mala practica", "mala_practica", "mala practica comercial", "cero tolerancia"].includes(normalized)) return "mala_practica";
+  return "venta";
+}
+
+function getDefaultEvaluationSections(formType, clientId = DEFAULT_CLIENT_ID) {
+  const type = normalizeEvaluationFormType(formType);
+  const templates = getEvaluationTemplatesForClient(clientId);
+  return (templates[type] || templates.venta)
+    .map(section => ({ resultado: "", detalleAuditado: "", oportunidadMejora: "", evidencia: "", puntaje: 0, ...section }));
+}
+
+function getEvaluationItemIdentityValues(item = {}) {
+  return [
+    item.nombreSeccion,
+    item.subItem,
+    item.item,
+    item.itemCalidad,
+    item.atributo,
+    item.atributoCalidad,
+    item.nombreAtributo,
+    item.pregunta,
+    item.criterio,
+    item.factor,
+    item.dimension
+  ].map(value => normalizeText(value)).filter(Boolean);
+}
+
+function findMatchingEvaluationItem(items, templateItem) {
+  const templateKeys = getEvaluationItemIdentityValues(templateItem);
+  if (!Array.isArray(items) || !items.length || !templateKeys.length) return null;
+  return items.find(item => {
+    const itemKeys = getEvaluationItemIdentityValues(item);
+    return itemKeys.some(itemKey => templateKeys.includes(itemKey));
+  }) || items.find(item => {
+    const itemKeys = getEvaluationItemIdentityValues(item);
+    return itemKeys.some(itemKey => templateKeys.some(templateKey => itemKey.includes(templateKey) || templateKey.includes(itemKey)));
+  }) || null;
+}
+
+function getStoredSectionResult(stored, templateSection) {
+  const explicitResult = stored?.resultado ?? stored?.cumplimiento ?? stored?.estadoCumplimiento ?? stored?.respuesta ?? stored?.resultadoItem ?? stored?.resultadoAtributo ?? stored?.status;
+  if (explicitResult !== undefined && explicitResult !== null && String(explicitResult).trim() !== "") return explicitResult;
+  const score = stored?.puntaje;
+  if (score !== undefined && score !== null && String(score).trim() !== "") {
+    const numericScore = Number(score);
+    const weight = Number(templateSection?.pesoSub || stored?.pesoSub || 0) || 0;
+    if (!Number.isNaN(numericScore) && weight > 0) return numericScore >= weight ? "Cumple" : "No cumple";
+  }
+  return templateSection.resultado;
+}
+
+export function normalizeEvaluationSections(sections, formType, clientId = DEFAULT_CLIENT_ID) {
+  const source = Array.isArray(sections) ? sections : [];
+  return getDefaultEvaluationSections(formType, clientId).map(templateSection => {
+    const stored = findMatchingEvaluationItem(source, templateSection) || {};
+    const result = getStoredSectionResult(stored, templateSection);
+    return {
+      ...stored,
+      categoria: templateSection.categoria,
+      pesoItem: templateSection.pesoItem,
+      nombreSeccion: templateSection.nombreSeccion,
+      criterio: templateSection.criterio,
+      pesoSub: templateSection.pesoSub,
+      resultado: result,
+      detalleAuditado: stored.detalleAuditado || "",
+      oportunidadMejora: stored.oportunidadMejora || "",
+      evidencia: stored.evidencia || "",
+      puntaje: stored.puntaje !== undefined ? stored.puntaje : templateSection.puntaje,
+      puntajeReponderado: stored.puntajeReponderado !== undefined ? stored.puntajeReponderado : stored.aporteReponderado,
+      aporteReponderado: stored.aporteReponderado !== undefined ? stored.aporteReponderado : stored.puntajeReponderado
+    };
+  });
+}
+
+export function calculateEvaluationScore(sections, formType, clientId = DEFAULT_CLIENT_ID) {
+  let applicableWeight = 0;
+  let rawAchievedWeight = 0;
+  for (const section of normalizeEvaluationSections(sections, formType, clientId)) {
+    const weight = Number(section.pesoSub || 0) || 0;
+    const result = normalizeText(section.resultado);
+    if (!weight || !result || result === "no aplica") continue;
+    applicableWeight += weight;
+    if (result === "cumple") rawAchievedWeight += weight;
+  }
+  const redistributedFactor = applicableWeight ? 100 / applicableWeight : 0;
+  const achievedWeight = applicableWeight ? rawAchievedWeight * redistributedFactor : 0;
+  const pct = achievedWeight;
+  const label = pct >= 90 ? "Excelente" : pct >= 80 ? "Cumple" : pct >= 60 ? "En seguimiento" : "Critico";
+  return { applicableWeight, rawAchievedWeight, achievedWeight, normalizedAchievedWeight: achievedWeight, redistributedFactor, pct, label, text: `${pct.toFixed(1)}% - ${label}` };
+}
+
+export function applyRedistributedSectionScores(sections, applicableWeight) {
+  const factor = applicableWeight ? 100 / applicableWeight : 0;
+  return (Array.isArray(sections) ? sections : []).map(section => {
+    const result = normalizeText(section?.resultado);
+    const weight = Number(section?.pesoSub || 0) || 0;
+    const rawScore = result === "cumple" ? weight : result === "no cumple" ? 0 : "";
+    const redistributedScore = result === "cumple" && factor ? weight * factor : result === "no cumple" ? 0 : "";
+    return {
+      ...section,
+      puntaje: section?.puntaje !== undefined ? section.puntaje : rawScore,
+      puntajeReponderado: redistributedScore,
+      aporteReponderado: redistributedScore
+    };
+  });
+}
+
+function normalizeEvaluationRecordForRuntime(record) {
+  if (!record || typeof record !== "object" || !Array.isArray(record.secciones) || !record.secciones.length) return record;
+  const evaluationFormType = normalizeEvaluationFormType(record.evaluationFormType || record.tipoFicha || record.formType || "venta");
+  const clientId = normalizeClientId(record.clientId || record.platformId);
+  const secciones = normalizeEvaluationSections(record.secciones, evaluationFormType, clientId);
+  const score = calculateEvaluationScore(secciones, evaluationFormType, clientId);
+  const scoredSections = applyRedistributedSectionScores(secciones, score.applicableWeight);
+  const appliesCeroTolerancia = Boolean(record.appliesCeroTolerancia) ||
+    evaluationFormType === "mala_practica" ||
+    (Array.isArray(record.zeroToleranceItems) && record.zeroToleranceItems.some(item => normalizeText(item?.resultado) === "cumple"));
+  return {
+    ...record,
+    clientId,
+    platformId: clientId,
+    evaluationFormType,
+    tipoFicha: EVALUATION_FORM_TYPES[evaluationFormType]?.label || "Venta",
+    secciones: scoredSections,
+    pesoAplicable: score.applicableWeight,
+    puntajeLogrado: appliesCeroTolerancia ? 0 : score.achievedWeight,
+    puntajeLogradoBruto: score.rawAchievedWeight,
+    resultadoGeneral: appliesCeroTolerancia ? "0.0% - Cero tolerancia" : score.text,
+    appliesCeroTolerancia
+  };
+}
+
+function buildFileFieldsFromSavedFiles(record, savedFiles, driveResult = {}) {
+  const files = Array.isArray(savedFiles) ? savedFiles : [];
+  const audioFile = files.find(isEvaluationAudioFile) || {};
+  const imageFile = files.find(isEvaluationImageFile) || {};
+  const storageFolder = driveResult.storageFolder || record.storageFolder || "";
+  const storageBucket = driveResult.storageBucket || record.storageBucket || "";
+  const warning = driveResult.storageWarning || driveResult.driveWarning || record.storageWarning || record.driveWarning || "";
+  return {
+    ...record,
+    files,
+    driveFolderAsesorId: driveResult.driveFolderAsesorId || record.driveFolderAsesorId || "",
+    driveFolderAsesorUrl: driveResult.driveFolderAsesorUrl || record.driveFolderAsesorUrl || "",
+    driveFolderEvaluacionId: driveResult.driveFolderEvaluacionId || record.driveFolderEvaluacionId || "",
+    driveFolderEvaluacionUrl: driveResult.driveFolderEvaluacionUrl || record.driveFolderEvaluacionUrl || "",
+    driveFolderId: driveResult.driveFolderEvaluacionId || record.driveFolderId || "",
+    driveFolderUrl: driveResult.driveFolderEvaluacionUrl || record.driveFolderUrl || "",
+    audioLlamadaId: audioFile.id || audioFile.fileId || record.audioLlamadaId || record.audioId || "",
+    audioLlamadaUrl: audioFile.publicUrl || audioFile.url || record.audioLlamadaUrl || record.audioUrl || "",
+    audioId: audioFile.id || audioFile.fileId || record.audioId || "",
+    audioUrl: audioFile.publicUrl || audioFile.url || record.audioUrl || "",
+    nombreArchivoAudio: audioFile.name || record.nombreArchivoAudio || "",
+    imagenEvidenciaId: imageFile.id || imageFile.fileId || record.imagenEvidenciaId || "",
+    imagenEvidenciaUrl: imageFile.publicUrl || imageFile.url || record.imagenEvidenciaUrl || "",
+    nombreArchivoImagen: imageFile.name || record.nombreArchivoImagen || "",
+    skippedAttachments: driveResult.skippedAttachments || record.skippedAttachments || [],
+    driveWarning: driveResult.driveWarning || record.driveWarning || "",
+    storageWarning: driveResult.storageWarning || record.storageWarning || "",
+    storageFolder,
+    storageBucket,
+    attachmentStorageProvider: storageFolder ? "firebase_storage" : (record.attachmentStorageProvider || ""),
+    uploadWarning: warning
+  };
+}
+
+function mergeFilesByIdentity(...fileGroups) {
+  const merged = [];
+  const seen = new Set();
+  for (const group of fileGroups) {
+    for (const file of Array.isArray(group) ? group : []) {
+      if (!file) continue;
+      const key = String(file.blobId || file.storagePath || file.id || file.fileId || file.url || file.publicUrl || file.name || "").trim();
+      const fallbackKey = JSON.stringify({
+        name: file.name || "",
+        mimeType: file.mimeType || "",
+        size: file.size || "",
+        type: file.type || file.kind || ""
+      });
+      const identity = key || fallbackKey;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      merged.push(file);
+    }
+  }
+  return merged;
+}
+
+function getSkippedAttachmentKey(file) {
+  return [
+    String(file?.name || "").trim(),
+    String(file?.mimeType || "").trim(),
+    String(file?.size || "").trim(),
+    String(file?.type || file?.kind || "").trim()
+  ].join("|");
+}
+
+async function uploadAttachmentsWithFirebaseFallback(owner, attachments) {
+  if (getDatabaseBackend() === "postgres") {
+    return uploadAttachmentsToRealtimeDatabase(owner, attachments);
+  }
+  const storageResult = await uploadAttachmentsToFirebaseStorage(owner, attachments);
+  if (storageResult.ok || !Array.isArray(storageResult.skippedAttachments) || !storageResult.skippedAttachments.length) {
+    return storageResult;
+  }
+
+  const skippedKeys = new Set(storageResult.skippedAttachments.map(getSkippedAttachmentKey));
+  const fallbackAttachments = (Array.isArray(attachments) ? attachments : []).filter(file =>
+    skippedKeys.has(getSkippedAttachmentKey(file))
+  );
+  const driveResult = await uploadEvaluationAttachmentsToDrive(owner, fallbackAttachments);
+  const storageWarning = driveResult.ok
+    ? `${storageResult.storageWarning || "Firebase Storage no disponible."} Se guardaron los adjuntos en Google Drive.`
+    : `${storageResult.storageWarning || "Firebase Storage no disponible."} ${driveResult.driveWarning || ""}`.trim();
+  return {
+    ...storageResult,
+    ok: driveResult.ok,
+    savedFiles: [...(storageResult.savedFiles || []), ...(driveResult.savedFiles || [])],
+    skippedAttachments: driveResult.skippedAttachments || [],
+    storageWarning,
+    fallbackStorageProvider: driveResult.ok ? "google_drive" : ""
+  };
+}
+
+async function withEvaluationWriteLock(id, task) {
+  const key = normalizeId(id);
+  const previous = evaluationWriteLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => {
+    release = resolve;
+  });
+  const chained = previous.then(() => current, () => current);
+  evaluationWriteLocks.set(key, chained);
+  try {
+    await previous.catch(() => {});
+    return await task();
+  } finally {
+    release();
+    if (evaluationWriteLocks.get(key) === chained) {
+      evaluationWriteLocks.delete(key);
+    }
+  }
+}
+
+async function readEvaluationRecordsFromFirebase(options = {}) {
+  const records = [];
+  const deletedIds = new Set((await readCachedSharedJson(DELETED_EVALUATIONS_KEY, []) || []).map(item => normalizeId(item?.id || item?.idEvaluacion || item)).filter(Boolean));
+  const isDeleted = record => deletedIds.has(normalizeId(record?.id || record?.idEvaluacion));
+  const compact = await readCachedSharedJson(EVALUATIONS_KEY, []);
+  if (Array.isArray(compact) && compact.length) {
+    return compact
+      .filter(record => !isDeleted(record))
+      .map(normalizeEvaluationRecordForRuntime)
+      .sort((a, b) => new Date(b.fechaEvaluacion || b.createdAt || 0) - new Date(a.fechaEvaluacion || a.createdAt || 0));
+  }
+
+  if (!options.includeDetailFallback) return [];
+  const detailKeys = await listSharedKeys("evaluation_record_");
+  for (const key of detailKeys) {
+    const detail = await readCachedSharedJson(key, null);
+    if (detail && typeof detail === "object") records.push(detail);
+  }
+
+  const byId = new Map();
+  for (const record of records) {
+    const id = normalizeId(record?.id || record?.idEvaluacion);
+    if (!id || deletedIds.has(id)) continue;
+    byId.set(id, { ...(byId.get(id) || {}), ...record, id });
+  }
+  return [...byId.values()]
+    .map(normalizeEvaluationRecordForRuntime)
+    .sort((a, b) => new Date(b.fechaEvaluacion || b.createdAt || 0) - new Date(a.fechaEvaluacion || a.createdAt || 0));
+}
+
+async function persistEvaluation(record) {
+  const id = normalizeId(record?.id || record?.idEvaluacion);
+  if (!id) throw new Error("No se puede guardar una evaluacion sin id.");
+  const evaluationFormType = normalizeEvaluationFormType(record?.evaluationFormType || record?.tipoFicha || record?.formType || "venta");
+  const clientId = normalizeClientId(record?.clientId || record?.platformId);
+  const secciones = normalizeEvaluationSections(record?.secciones, evaluationFormType, clientId);
+  const score = calculateEvaluationScore(secciones, evaluationFormType, clientId);
+  const scoredSections = applyRedistributedSectionScores(secciones, score.applicableWeight);
+  const appliesCeroTolerancia = Boolean(record?.appliesCeroTolerancia) ||
+    evaluationFormType === "mala_practica" ||
+    (Array.isArray(record?.zeroToleranceItems) && record.zeroToleranceItems.some(item => normalizeText(item?.resultado) === "cumple"));
+  const normalized = {
+    ...record,
+    id,
+    idEvaluacion: id,
+    clientId,
+    platformId: clientId,
+    evaluationFormType,
+    tipoFicha: EVALUATION_FORM_TYPES[evaluationFormType]?.label || "Venta",
+    secciones: scoredSections,
+    pesoAplicable: score.applicableWeight,
+    puntajeLogrado: appliesCeroTolerancia ? 0 : score.achievedWeight,
+    puntajeLogradoBruto: score.rawAchievedWeight,
+    resultadoGeneral: appliesCeroTolerancia ? "0.0% - Cero tolerancia" : score.text,
+    appliesCeroTolerancia,
+    updatedAt: nowIso()
+  };
+  await writeSharedRecord(getEvaluationRecordKey(id), normalized);
+  await withEvaluationIndexWriteLock(async () => {
+    const currentIndex = await readCachedSharedJson(EVALUATIONS_KEY, []);
+    const compactIndex = (Array.isArray(currentIndex) ? currentIndex : []).map(buildEvaluationIndexRecord);
+    await writeSharedRecord(EVALUATIONS_KEY, upsertById(compactIndex, buildEvaluationIndexRecord(normalized)));
+    invalidateFirebaseCache(EVALUATIONS_KEY);
+  });
+  invalidateFirebaseCache(getEvaluationRecordKey(id));
+  return normalized;
+}
+
+function normalizeCalibrationStatus(value) {
+  const normalized = normalizeText(value);
+  const aliases = {
+    borrador: "draft",
+    draft: "draft",
+    programada: "scheduled",
+    scheduled: "scheduled",
+    "en vivo": "live",
+    live: "live",
+    finalizada: "finalized",
+    finalized: "finalized",
+    "cerrada con resultados": "closed_results",
+    closed: "closed_results",
+    "closed results": "closed_results",
+    closed_results: "closed_results",
+    anulada: "annulled",
+    annullada: "annulled",
+    cancelled: "annulled",
+    canceled: "annulled",
+    annulled: "annulled"
+  };
+  return aliases[normalized] || "draft";
+}
+
+function normalizeCalibrationResult(value) {
+  const normalized = normalizeText(value);
+  if (["cumple", "correcto", "ok", "aprobado"].includes(normalized)) return "cumple";
+  if (["no cumple", "incumple", "incorrecto", "error", "mala practica"].includes(normalized) || normalized.includes("no cumple")) return "no_cumple";
+  if (["no aplica", "na", "n/a", "no aplicable"].includes(normalized)) return "no_aplica";
+  return normalized || "";
+}
+
+function getCalibrationSectionKey(section = {}) {
+  return normalizeText(section.nombreSeccion || section.subItem || section.item || section.criterio || section.pregunta || section.id || "");
+}
+
+function getUserCalibrationArea(user = {}) {
+  const role = getRole(user);
+  if (String(user.area || "").trim()) return String(user.area).trim();
+  if (role === "formador") return "Formacion";
+  if (role === "analista" || role === "admin" || role === "referente_experto") return "Calidad";
+  if (role === "supervisor" || role === "asesor") return "Operaciones";
+  return "Otros";
+}
+
+async function readCalibrationCollection(key) {
+  const value = await readCachedSharedJson(key, []);
+  return Array.isArray(value) ? value : [];
+}
+
+async function writeCalibrationCollection(key, records) {
+  await writeSharedRecord(key, Array.isArray(records) ? records : []);
+  invalidateFirebaseCache(key);
+}
+
+function getRecordClientId(record = {}) {
+  return normalizeClientId(record.clientId || record.platformId || record.tenantId);
+}
+
+function isRecordVisibleForClient(record = {}, clientId = DEFAULT_CLIENT_ID) {
+  const rawClient = record?.clientId || record?.platformId || record?.tenantId || "";
+  const recordClientId = normalizeClientId(rawClient);
+  const currentClientId = normalizeClientId(clientId);
+  if (currentClientId === DEFAULT_CLIENT_ID) return !rawClient || recordClientId === DEFAULT_CLIENT_ID;
+  return recordClientId === currentClientId;
+}
+
+function withClientScope(record = {}, clientId = DEFAULT_CLIENT_ID, clientName = "") {
+  const scopedClientId = normalizeClientId(clientId);
+  return {
+    ...record,
+    clientId: scopedClientId,
+    platformId: scopedClientId,
+    clientName: String(clientName || record.clientName || record.platformName || "").trim(),
+    platformName: String(clientName || record.platformName || record.clientName || "").trim()
+  };
+}
+
+async function addCalibrationLog(sessionId, user, actionType, description, scope = {}) {
+  const logs = await readCalibrationCollection(CALIBRATION_ACTIVITY_LOGS_KEY);
+  const clientId = normalizeClientId(scope.clientId || scope.platformId || user?.clientId || user?.platformId);
+  const clientName = String(scope.clientName || scope.platformName || user?.clientName || user?.platformName || "").trim();
+  const log = {
+    id: normalizeId(generateNumericId()),
+    calibration_session_id: normalizeId(sessionId),
+    clientId,
+    platformId: clientId,
+    clientName,
+    platformName: clientName,
+    user_id: String(user?.usuario || user?.user_id || "").trim(),
+    user_name: String(user?.nombre || user?.user_name || "").trim(),
+    role: getRole(user),
+    action_type: String(actionType || "").trim(),
+    action_description: String(description || "").trim(),
+    created_at: nowIso()
+  };
+  await writeCalibrationCollection(CALIBRATION_ACTIVITY_LOGS_KEY, [log, ...logs]);
+  return log;
+}
+
+function canManageCalibration(user) {
+  return ["admin", "analista"].includes(getRole(user));
+}
+
+function canViewCalibrationModule(user) {
+  return ["admin", "analista", "supervisor", "formador", "referente_experto"].includes(getRole(user));
+}
+
+function canUserSeeCalibration(session, user) {
+  if (canManageCalibration(user)) return true;
+  const userId = String(user?.usuario || "").trim();
+  if (!userId) return false;
+  if (String(session?.expert_referent_id || "") === userId) return true;
+  return (session?.participants || []).some(item => String(item?.user_id || "") === userId);
+}
+
+function validateCalibrationCanStart(session) {
+  const required = [
+    ["title", "nombre de la calibracion"],
+    ["evaluation_type", "tipo de audio"],
+    ["call_date", "fecha de llamada"],
+    ["call_time", "hora de llamada"],
+    ["campaign_name", "campana o servicio"],
+    ["evaluated_agent_name", "asesor evaluado"],
+    ["call_typification", "tipificacion"],
+    ["call_result", "resultado de llamada"],
+    ["expert_referent_id", "Referente Experto"]
+  ];
+  const missing = required.filter(([key]) => !String(session?.[key] || "").trim()).map(([, label]) => label);
+  const hasAudio = Boolean(session?.audio_url || session?.audio_file?.previewUrl || session?.audio_file?.downloadUrl || session?.audio_file?.id);
+  if (!hasAudio) missing.push("audio de la llamada");
+  if (!Array.isArray(session?.participants) || !session.participants.length) missing.push("participantes");
+  if (missing.length) throw new Error(`No se puede iniciar la calibracion. Faltan: ${missing.join(", ")}.`);
+}
+
+function buildCalibrationParticipantRecord(sessionId, user, overrides = {}) {
+  const userId = String(overrides.user_id || user?.user_id || user?.usuario || "").trim();
+  const clientId = normalizeClientId(overrides.clientId || overrides.platformId || user?.clientId || user?.platformId);
+  const clientName = String(overrides.clientName || overrides.platformName || user?.clientName || user?.platformName || "").trim();
+  return {
+    id: `${sessionId}_${userId}`,
+    calibration_session_id: sessionId,
+    clientId,
+    platformId: clientId,
+    clientName,
+    platformName: clientName,
+    user_id: userId,
+    user_name: String(overrides.user_name || user?.user_name || user?.nombre || "").trim(),
+    role: String(overrides.role || user?.role || user?.rol || "").trim().toLowerCase(),
+    area: overrides.area || user?.area || getUserCalibrationArea(user),
+    participation_status: overrides.participation_status || user?.participation_status || "assigned",
+    joined_at: overrides.joined_at || user?.joined_at || "",
+    submitted_at: overrides.submitted_at || user?.submitted_at || "",
+    is_expert_referent: Boolean(overrides.is_expert_referent || user?.is_expert_referent),
+    created_at: overrides.created_at || user?.created_at || nowIso()
+  };
+}
+
+function buildCalibrationItemRows(evaluationId, sections, evaluationType, scope = {}) {
+  const clientId = normalizeClientId(scope.clientId || scope.platformId);
+  const clientName = String(scope.clientName || scope.platformName || "").trim();
+  return normalizeEvaluationSections(sections, evaluationType).map(section => {
+    const result = normalizeCalibrationResult(section.resultado);
+    const weight = Number(section.pesoSub || 0) || 0;
+    const obtained = result === "cumple" ? weight : 0;
+    return {
+      id: `${evaluationId}_${getCalibrationSectionKey(section) || generateNumericId()}`,
+      calibration_evaluation_id: evaluationId,
+      clientId,
+      platformId: clientId,
+      clientName,
+      platformName: clientName,
+      item_id: normalizeText(section.categoria),
+      item_name: section.categoria || "",
+      subitem_id: getCalibrationSectionKey(section),
+      subitem_name: section.nombreSeccion || section.subItem || "",
+      result,
+      obtained_score: obtained,
+      weight,
+      comment: section.detalleAuditado || section.comment || "",
+      is_critical: false,
+      is_zero_tolerance: false,
+      created_at: nowIso()
+    };
+  });
+}
+
+function calculateCalibrationScore(sections, zeroToleranceItems, evaluationType) {
+  const score = calculateEvaluationScore(sections, evaluationType);
+  const appliesZero = normalizeEvaluationFormType(evaluationType) === "mala_practica" ||
+    (Array.isArray(zeroToleranceItems) && zeroToleranceItems.some(item => normalizeText(item?.resultado) === "cumple"));
+  return {
+    ...score,
+    pct: appliesZero ? 0 : score.pct,
+    text: appliesZero ? "0.0% - Cero tolerancia" : score.text,
+    appliesZero
+  };
+}
+
+function compareCalibrationEvaluation(session, expertEvaluation, participantEvaluation) {
+  const evaluationType = session.evaluation_type || "venta";
+  const clientId = getRecordClientId(session);
+  const clientName = String(session.clientName || session.platformName || "").trim();
+  const expertSections = normalizeEvaluationSections(expertEvaluation?.sections || expertEvaluation?.secciones || [], evaluationType);
+  const participantSections = normalizeEvaluationSections(participantEvaluation?.sections || participantEvaluation?.secciones || [], evaluationType);
+  const participantByKey = new Map(participantSections.map(section => [getCalibrationSectionKey(section), section]));
+  const comparisonRows = [];
+  let matches = 0;
+  let compared = 0;
+  let criticalMatches = 0;
+  let criticalCompared = 0;
+
+  expertSections.forEach(expertSection => {
+    const key = getCalibrationSectionKey(expertSection);
+    const participantSection = participantByKey.get(key) || {};
+    const expertResult = normalizeCalibrationResult(expertSection.resultado);
+    const participantResult = normalizeCalibrationResult(participantSection.resultado);
+    const weight = Number(expertSection.pesoSub || 0) || 0;
+    const expertScore = expertResult === "cumple" ? weight : 0;
+    const participantScore = participantResult === "cumple" ? weight : 0;
+    const matchStatus = expertResult && participantResult && expertResult === participantResult ? "coincide" : expertResult && participantResult ? "no_coincide" : "parcial";
+    if (expertResult || participantResult) {
+      compared += 1;
+      if (matchStatus === "coincide") matches += 1;
+    }
+    if (normalizeText(expertSection.categoria).includes("cero") || normalizeText(expertSection.nombreSeccion).includes("tipificacion")) {
+      criticalCompared += 1;
+      if (matchStatus === "coincide") criticalMatches += 1;
+    }
+    comparisonRows.push({
+      id: `${session.id}_${participantEvaluation.user_id}_${key || comparisonRows.length}`,
+      calibration_session_id: session.id,
+      clientId,
+      platformId: clientId,
+      clientName,
+      platformName: clientName,
+      item_id: normalizeText(expertSection.categoria),
+      subitem_id: key,
+      item_name: expertSection.categoria || "",
+      subitem_name: expertSection.nombreSeccion || "",
+      weight,
+      expert_response: expertResult,
+      expert_score: expertScore,
+      participant_user_id: participantEvaluation.user_id,
+      participant_user_name: participantEvaluation.user_name,
+      participant_response: participantResult,
+      participant_score: participantScore,
+      score_difference: participantScore - expertScore,
+      match_status: matchStatus,
+      expert_comment: expertSection.detalleAuditado || "",
+      participant_comment: participantSection.detalleAuditado || "",
+      created_at: nowIso()
+    });
+  });
+
+  const expertScore = Number(expertEvaluation.total_score || 0) || 0;
+  const userScore = Number(participantEvaluation.total_score || 0) || 0;
+  const scoreDeviation = userScore - expertScore;
+  const itemMatchPercentage = compared ? matches / compared * 100 : 0;
+  const scoreCloseness = Math.max(0, 100 - Math.abs(scoreDeviation));
+  const typificationMatch = normalizeText(participantEvaluation.selected_typification) && normalizeText(participantEvaluation.selected_typification) === normalizeText(expertEvaluation.selected_typification);
+  const criticalMatchPercentage = criticalCompared ? criticalMatches / criticalCompared * 100 : itemMatchPercentage;
+  const zeroToleranceMatchPercentage = criticalMatchPercentage;
+  const affinity = itemMatchPercentage * 0.50 + scoreCloseness * 0.25 + (typificationMatch ? 100 : 0) * 0.15 + criticalMatchPercentage * 0.10;
+  const level = affinity >= 90 ? "Muy calibrado" : affinity >= 80 ? "Calibrado" : affinity >= 70 ? "Requiere ajuste" : "No calibrado";
+  const mainDifferences = comparisonRows.filter(row => row.match_status !== "coincide").slice(0, 5).map(row => row.subitem_name || row.item_name);
+
+  return {
+    result: {
+      id: `${session.id}_${participantEvaluation.user_id}`,
+      calibration_session_id: session.id,
+      clientId,
+      platformId: clientId,
+      clientName,
+      platformName: clientName,
+      user_id: participantEvaluation.user_id,
+      user_name: participantEvaluation.user_name,
+      role: participantEvaluation.role || "",
+      area: participantEvaluation.area || "",
+      user_score: userScore,
+      expert_score: expertScore,
+      score_deviation: scoreDeviation,
+      affinity_percentage: Number(affinity.toFixed(1)),
+      item_match_percentage: Number(itemMatchPercentage.toFixed(1)),
+      subitem_match_percentage: Number(itemMatchPercentage.toFixed(1)),
+      typification_match: typificationMatch,
+      critical_criteria_match_percentage: Number(criticalMatchPercentage.toFixed(1)),
+      zero_tolerance_match_percentage: Number(zeroToleranceMatchPercentage.toFixed(1)),
+      calibration_level: level,
+      ranking_position: 0,
+      main_differences: mainDifferences,
+      improvement_opportunities: mainDifferences.map(item => `Reforzar criterio: ${item}`),
+      created_at: nowIso()
+    },
+    comparisonRows
+  };
+}
+
+async function recomputeCalibrationResults(sessionId) {
+  const sessions = await readCalibrationCollection(CALIBRATION_SESSIONS_KEY);
+  const session = sessions.find(item => normalizeId(item.id) === normalizeId(sessionId));
+  if (!session) throw new Error("No se encontro la calibracion.");
+  const evaluations = await readCalibrationCollection(CALIBRATION_EVALUATIONS_KEY);
+  const sessionEvaluations = evaluations.filter(item => normalizeId(item.calibration_session_id) === normalizeId(sessionId) && item.submitted);
+  const expertId = String(session.expert_referent_id || "").trim();
+  const expert = sessionEvaluations.find(item => item.is_expert_referent || String(item.user_id || "") === expertId);
+  if (!expert) throw new Error("No se puede cerrar la calibracion: falta la evaluacion del Referente Experto.");
+  const participants = sessionEvaluations.filter(item => !item.is_expert_referent && String(item.user_id || "") !== expertId);
+  const comparisons = participants.map(item => compareCalibrationEvaluation(session, expert, item));
+  const results = comparisons.map(item => item.result).sort((a, b) => b.affinity_percentage - a.affinity_percentage);
+  results.forEach((item, index) => { item.ranking_position = index + 1; });
+  const allResults = await readCalibrationCollection(CALIBRATION_RESULTS_KEY);
+  const allComparisons = await readCalibrationCollection(CALIBRATION_COMPARISON_KEY);
+  const nextResults = [
+    ...allResults.filter(item => normalizeId(item.calibration_session_id) !== normalizeId(sessionId)),
+    ...results
+  ];
+  const nextComparisons = [
+    ...allComparisons.filter(item => normalizeId(item.calibration_session_id) !== normalizeId(sessionId)),
+    ...comparisons.flatMap(item => item.comparisonRows)
+  ];
+  await writeCalibrationCollection(CALIBRATION_RESULTS_KEY, nextResults);
+  await writeCalibrationCollection(CALIBRATION_COMPARISON_KEY, nextComparisons);
+  return { results, comparisonRows: comparisons.flatMap(item => item.comparisonRows) };
+}
+
+function buildTransientCalibrationResults(session, sessionEvaluations, savedResults, savedComparisonRows) {
+  const expertId = String(session.expert_referent_id || "").trim();
+  const expert = (sessionEvaluations || []).find(item => item.submitted && (item.is_expert_referent || String(item.user_id || "") === expertId));
+  if (!expert) return { results: savedResults || [], comparisonRows: savedComparisonRows || [] };
+  if ((savedResults || []).length && (savedComparisonRows || []).length) {
+    return { results: savedResults, comparisonRows: savedComparisonRows };
+  }
+  const participantEvaluations = (sessionEvaluations || []).filter(item => (
+    item.submitted &&
+    !item.is_expert_referent &&
+    String(item.user_id || "") !== expertId
+  ));
+  const comparisons = participantEvaluations.map(item => compareCalibrationEvaluation(session, expert, item));
+  const transientResults = comparisons
+    .map(item => ({ ...item.result, transient: true }))
+    .sort((a, b) => Number(b.affinity_percentage || 0) - Number(a.affinity_percentage || 0));
+  transientResults.forEach((item, index) => { item.ranking_position = index + 1; });
+  const transientComparisonRows = comparisons.flatMap(item => item.comparisonRows.map(row => ({ ...row, transient: true })));
+  return {
+    results: (savedResults || []).length ? savedResults : transientResults,
+    comparisonRows: (savedComparisonRows || []).length ? savedComparisonRows : transientComparisonRows
+  };
+}
+
+function getSalesValidationDuplicateKey(record = {}) {
+  return [
+    normalizeClientId(record.clientId || record.platformId || record.tenantId),
+    normalizeText(record.ruc),
+    normalizeDateOrNow(record.saleDate || record.fechaVenta || "").slice(0, 10),
+    normalizeText(record.callId || record.numeroLlamada || record.interactionId)
+  ].join("|");
+}
+
+function buildSalesValidationAudit(existing = {}, next = {}, currentUser = {}, action = "updated", extra = {}) {
+  const now = nowIso();
+  const base = {
+    id: normalizeId(generateNumericId()),
+    action,
+    userId: String(currentUser.usuario || "").trim(),
+    userName: String(currentUser.nombre || "").trim(),
+    userRole: ROLE_LABELS[getRole(currentUser)] || getRole(currentUser),
+    createdAt: now,
+    ...extra
+  };
+  if (action !== "updated") return [base];
+  const fields = [
+    "ruc", "businessName", "agentName", "agentCode", "saleDate", "campaign", "product",
+    "quantity", "callId", "audioStatus", "contractReadingStatus", "omittedContractInfo",
+    "observations", "result", "status"
+  ];
+  return fields
+    .filter(field => JSON.stringify(existing?.[field] ?? "") !== JSON.stringify(next?.[field] ?? ""))
+    .map(field => ({
+      ...base,
+      id: normalizeId(generateNumericId()),
+      field,
+      previousValue: existing?.[field] ?? "",
+      newValue: next?.[field] ?? ""
+    }));
+}
+
+async function readSalesValidations() {
+  const records = await readCachedSharedJson(SALES_VALIDATIONS_KEY, []);
+  return Array.isArray(records) ? records : [];
+}
+
+async function writeSalesValidations(records) {
+  await writeSharedRecord(SALES_VALIDATIONS_KEY, Array.isArray(records) ? records : []);
+  invalidateFirebaseCache(SALES_VALIDATIONS_KEY);
+}
+
+function getFirstNamePrefix(value, fallback = "AGE") {
+  const first = String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .split(/\s+/)[0] || fallback;
+  return first.replace(/[^a-zA-Z]/g, "").slice(0, 3).toUpperCase().padEnd(3, "X");
+}
+
+function getSequentialNumberFromCode(code) {
+  const match = String(code || "").match(/(\d+)\s*$/);
+  return match ? Number(match[1]) || 0 : 0;
+}
+
+function buildNextSalesAgentCode(agentName, records = []) {
+  const maxRegistered = (records || []).reduce((max, record) => Math.max(max, getSequentialNumberFromCode(record?.agentCode || record?.codigoAgente)), 162);
+  return `${getFirstNamePrefix(agentName)}${maxRegistered + 1}`;
+}
+
+function normalizeSalesValidationPayload(payload = {}, existing = {}, currentUser = {}) {
+  const now = nowIso();
+  const audioStatus = String(payload.audioStatus || existing.audioStatus || "").trim();
+  const contractReadingStatus = String(payload.contractReadingStatus || existing.contractReadingStatus || "").trim();
+  const result = String(payload.result || existing.result || "").trim();
+  const ruc = String(payload.ruc || existing.ruc || "").trim();
+  const businessName = String(payload.businessName || payload.razonSocial || existing.businessName || "").trim();
+  const agentName = String(payload.agentName || payload.agenteComercial || existing.agentName || "").trim();
+  const saleDate = String(payload.saleDate || payload.fechaVenta || existing.saleDate || "").trim();
+  const callId = String(payload.callId || payload.numeroLlamada || payload.interactionId || existing.callId || "").trim();
+  const clientId = normalizeClientId(payload.clientId || payload.platformId || payload.tenantId || existing.clientId || existing.platformId || existing.tenantId);
+  const clientName = String(payload.clientName || payload.platformName || existing.clientName || existing.platformName || "").trim();
+  if (!ruc) throw new Error("El RUC del cliente es obligatorio.");
+  if (!businessName) throw new Error("La razon social es obligatoria.");
+  if (!agentName) throw new Error("El agente comercial es obligatorio.");
+  if (!saleDate) throw new Error("La fecha de venta es obligatoria.");
+  if (!audioStatus) throw new Error("Debes indicar si se encontro audio en InConcert.");
+  if (!contractReadingStatus) throw new Error("Debes indicar el estado de lectura o confirmacion del contrato.");
+  if (!result) throw new Error("El resultado de la validacion es obligatorio.");
+  const audioNeedsObservation = normalizeText(audioStatus) !== "si, se encontro audio" && normalizeText(audioStatus) !== "si se encontro audio";
+  const observations = String(payload.observations || payload.observaciones || existing.observations || "").trim();
+  if (audioNeedsObservation && !observations) throw new Error("La observacion es obligatoria cuando el audio no fue encontrado o presenta incidencias.");
+  if (["no", "parcial"].includes(normalizeText(contractReadingStatus)) && !String(payload.omittedContractInfo || existing.omittedContractInfo || "").trim()) {
+    throw new Error("Debes detallar la informacion contractual omitida.");
+  }
+  const id = normalizeId(payload.id || existing.id || generateNumericId());
+  const validationDate = existing.validationDate || now;
+  return {
+    ...existing,
+    id,
+    clientId,
+    platformId: clientId,
+    clientName,
+    platformName: clientName,
+    ruc,
+    businessName,
+    agentName,
+    agentCode: String(payload.agentCode || payload.codigoAgente || existing.agentCode || "").trim(),
+    saleDate,
+    campaign: String(payload.campaign || payload.campana || existing.campaign || "").trim(),
+    product: String(payload.product || payload.producto || existing.product || "").trim(),
+    quantity: String(payload.quantity || payload.cantidad || existing.quantity || "").trim(),
+    callId,
+    audioStatus,
+    contractReadingStatus,
+    omittedContractInfo: String(payload.omittedContractInfo || existing.omittedContractInfo || "").trim(),
+    observations,
+    result,
+    validatorId: existing.validatorId || String(currentUser.usuario || "").trim(),
+    validatorName: existing.validatorName || String(currentUser.nombre || "").trim(),
+    validationDate,
+    status: existing.status || "Activa",
+    files: Array.isArray(existing.files) ? existing.files : [],
+    auditTrail: Array.isArray(existing.auditTrail) ? existing.auditTrail : [],
+    createdAt: existing.createdAt || now,
+    updatedAt: now,
+    updatedBy: String(currentUser.usuario || "").trim(),
+    updatedByName: String(currentUser.nombre || "").trim()
+  };
+}
+
+async function readCommercialDevelopmentRecords() {
+  const records = await readCachedSharedJson(COMMERCIAL_DEVELOPMENT_KEY, []);
+  return Array.isArray(records) ? records : [];
+}
+
+async function writeCommercialDevelopmentRecords(records) {
+  await writeSharedRecord(COMMERCIAL_DEVELOPMENT_KEY, Array.isArray(records) ? records : []);
+  invalidateFirebaseCache(COMMERCIAL_DEVELOPMENT_KEY);
+}
+
+function buildNextCommercialDevelopmentCode(records = []) {
+  const maxRegistered = (records || []).reduce((max, record) => {
+    const match = String(record?.code || record?.codigo || "").match(/^ENT(\d+)$/i);
+    return Math.max(max, match ? Number(match[1]) || 0 : 0);
+  }, 0);
+  return `ENT${String(maxRegistered + 1).padStart(2, "0")}`;
+}
+
+function getCommercialDevelopmentRecordType(record = {}) {
+  return normalizeText(record.recordType || record.type || record.tipoRegistro || "historial") === "control" ? "control" : "historial";
+}
+
+function isCommercialDevelopmentControl(record = {}) {
+  return getCommercialDevelopmentRecordType(record) === "control";
+}
+
+function normalizeCommercialAdvisorPrefix(name = "") {
+  const letters = String(name || "GEN")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z]/g, "")
+    .slice(0, 3)
+    .toUpperCase();
+  return (letters || "GEN").padEnd(3, "X");
+}
+
+function buildCommercialDevelopmentHistoryCode(payload = {}) {
+  const date = new Date(payload.interventionAt || payload.createdAt || Date.now());
+  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  const dd = String(safeDate.getDate()).padStart(2, "0");
+  const mm = String(safeDate.getMonth() + 1).padStart(2, "0");
+  const yyyy = safeDate.getFullYear();
+  return `ENT-${normalizeCommercialAdvisorPrefix(payload.executiveName)}-${dd}-${mm}-${yyyy}`;
+}
+
+function buildCommercialDevelopmentControlCode(parent = {}, records = []) {
+  const baseCode = String(parent.code || parent.codigo || "ENT-CTRL").trim();
+  const parentId = normalizeId(parent.id);
+  const maxRegistered = (records || [])
+    .filter(record => isCommercialDevelopmentControl(record))
+    .filter(record => normalizeId(record.parentId || record.historyId) === parentId)
+    .reduce((max, record) => {
+      const match = String(record.code || record.codigo || "").match(/-(\d+)$/);
+      return Math.max(max, match ? Number(match[1]) || 0 : 0);
+    }, 0);
+  return `${baseCode}-${String(maxRegistered + 1).padStart(2, "0")}`;
+}
+
+function normalizeCommercialDevelopmentGaps(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map(item => typeof item === "string" ? { name: item, group: "General", status: "En mejora" } : {
+        group: String(item?.group || item?.grupo || "General").trim() || "General",
+        name: String(item?.name || item?.brecha || item?.label || "").trim(),
+        status: String(item?.status || item?.estado || "En mejora").trim() || "En mejora"
+      })
+      .filter(item => item.name);
+  }
+  return String(value || "")
+    .split(/[;,]/)
+    .map(item => item.trim())
+    .filter(Boolean)
+    .map(name => ({ group: "General", name, status: "En mejora" }));
+}
+
+function normalizeCommercialDevelopmentStatus(record = {}) {
+  const status = String(record.status || "En seguimiento").trim() || "En seguimiento";
+  const normalized = normalizeText(status);
+  if (normalized === "eliminada") return "Eliminada";
+  if (normalized === "cerrado" || normalized === "finalizado") return "Cerrado";
+  const createdAt = record.createdAt || record.interventionAt || record.fechaIntervencion || "";
+  const createdMs = createdAt ? new Date(createdAt).getTime() : 0;
+  if (createdMs && !Number.isNaN(createdMs) && Date.now() - createdMs >= 48 * 60 * 60 * 1000) {
+    return "Cerrado";
+  }
+  return status;
+}
+
+function normalizeCommercialDevelopmentPayload(payload = {}, existing = {}, currentUser = {}, records = []) {
+  const now = nowIso();
+  const clientId = normalizeClientId(payload.clientId || payload.platformId || existing.clientId || existing.platformId || currentUser.clientId || currentUser.platformId);
+  if (clientId !== COMMERCIAL_DEVELOPMENT_CLIENT_ID) throw new Error("Desarrollo comercial solo esta disponible en su plataforma independiente.");
+  const recordType = getCommercialDevelopmentRecordType(payload.recordType || payload.type ? payload : existing);
+  const id = normalizeId(payload.id || existing.id || generateNumericId());
+  const createdBy = existing.createdBy || String(currentUser.usuario || "").trim();
+  const createdByName = existing.createdByName || String(currentUser.nombre || currentUser.usuario || "").trim();
+  const createdByRole = existing.createdByRole || getRole(currentUser);
+  const common = {
+    ...existing,
+    id,
+    recordType,
+    clientId,
+    platformId: clientId,
+    clientName: String(payload.clientName || payload.platformName || existing.clientName || "Desarrollo Comercial").trim(),
+    platformName: String(payload.platformName || payload.clientName || existing.platformName || "Desarrollo Comercial").trim(),
+    files: Array.isArray(existing.files) ? existing.files : [],
+    auditTrail: Array.isArray(existing.auditTrail) ? existing.auditTrail : [],
+    createdBy,
+    createdByName,
+    createdByRole,
+    createdAt: existing.createdAt || now,
+    updatedAt: now,
+    updatedBy: String(currentUser.usuario || "").trim(),
+    updatedByName: String(currentUser.nombre || currentUser.usuario || "").trim(),
+    updatedByRole: getRole(currentUser)
+  };
+
+  if (recordType === "control") {
+    const parentId = normalizeId(payload.parentId || payload.historyId || existing.parentId || existing.historyId);
+    const parent = (records || []).find(record => normalizeId(record?.id) === parentId) || {};
+    if (!parentId || !normalizeId(parent.id)) throw new Error("Selecciona el registro de historial asociado.");
+    const status = normalizeCommercialDevelopmentStatus({
+      ...existing,
+      status: String(payload.status || existing.status || "En seguimiento").trim() || "En seguimiento",
+      createdAt: existing.createdAt || payload.createdAt || now
+    });
+    return {
+      ...common,
+      parentId,
+      historyId: parentId,
+      code: String(existing.code || payload.code || payload.codigo || "").trim() || buildCommercialDevelopmentControlCode(parent, records),
+      executiveName: String(parent.executiveName || payload.executiveName || existing.executiveName || "").trim(),
+      campaign: String(parent.campaign || payload.campaign || existing.campaign || "").trim(),
+      supervisor: String(parent.supervisor || parent.supervisorName || payload.supervisor || existing.supervisor || "").trim(),
+      responsibleName: String(parent.responsibleName || payload.responsibleName || existing.responsibleName || "").trim(),
+      responsibleUser: String(parent.responsibleUser || payload.responsibleUser || existing.responsibleUser || "").trim(),
+      responsibleRole: String(parent.responsibleRole || payload.responsibleRole || existing.responsibleRole || "").trim(),
+      generalObservation: String(payload.generalObservation || payload.observacionGeneral || existing.generalObservation || "").trim(),
+      gapsWorked: Array.isArray(payload.gapsWorked) ? payload.gapsWorked : (Array.isArray(existing.gapsWorked) ? existing.gapsWorked : []),
+      interventionType: String(payload.interventionType || payload.intervencion || existing.interventionType || "").trim(),
+      actionTaken: String(payload.actionTaken || payload.accion || existing.actionTaken || "").trim(),
+      improvementCommitment: String(payload.improvementCommitment || payload.compromiso || existing.improvementCommitment || "").trim(),
+      nextControlDate: String(payload.nextControlDate || existing.nextControlDate || "").trim(),
+      nextControlTime: String(payload.nextControlTime || existing.nextControlTime || "").trim(),
+      notificationEmail: String(payload.notificationEmail || payload.email || existing.notificationEmail || "").trim(),
+      meetingLink: String(payload.meetingLink || payload.meetLink || existing.meetingLink || "").trim(),
+      status,
+      closedAt: normalizeText(status) === "cerrado" ? (existing.closedAt || now) : ""
+    };
+  }
+
+  const executiveName = String(payload.executiveName || payload.asesor || payload.ejecutivo || existing.executiveName || "").trim();
+  const interventionAt = String(payload.interventionAt || payload.fechaIntervencion || existing.interventionAt || now).trim();
+  const responsibleName = String(payload.responsibleName || payload.responsableSeguimiento || payload.trainerName || payload.formador || existing.responsibleName || existing.trainerName || "").trim();
+  const responsibleUser = String(payload.responsibleUser || existing.responsibleUser || "").trim();
+  const responsibleRole = String(payload.responsibleRole || existing.responsibleRole || "").trim();
+  const gaps = normalizeCommercialDevelopmentGaps(payload.gaps || payload.brechas || existing.gaps || existing.reason);
+  if (!executiveName) throw new Error("El asesor o ejecutivo es obligatorio.");
+  if (!responsibleName && !responsibleUser) throw new Error("El responsable del seguimiento es obligatorio.");
+  if (!interventionAt) throw new Error("La fecha y hora de intervencion es obligatoria.");
+  if (!gaps.length) throw new Error("Selecciona al menos una oportunidad de mejora.");
+  const status = normalizeCommercialDevelopmentStatus({
+    ...existing,
+    status: String(payload.status || existing.status || "En seguimiento").trim() || "En seguimiento",
+    createdAt: existing.createdAt || payload.createdAt || now,
+    interventionAt
+  });
+  const closeReason = String(payload.closeReason || existing.closeReason || "").trim();
+  if (normalizeText(status) === "cerrado" && normalizeText(closeReason) === "resultado final") {
+    if (!String(payload.finalComment || existing.finalComment || payload.finalObservations || existing.finalObservations || "").trim()) throw new Error("El comentario final es obligatorio para cerrar por resultado final.");
+    if (String(payload.finalActiveQ ?? existing.finalActiveQ ?? payload.followSales ?? existing.followSales ?? "").trim() === "") throw new Error("El Q de activas final es obligatorio.");
+    if (String(payload.finalProductivityIn ?? existing.finalProductivityIn ?? payload.followProductivity ?? existing.followProductivity ?? "").trim() === "") throw new Error("La productividad final es obligatoria.");
+    if (String(payload.finalQualityScore ?? existing.finalQualityScore ?? payload.followConnection ?? existing.followConnection ?? "").trim() === "") throw new Error("La nota de calidad final es obligatoria.");
+  }
+  return {
+    ...common,
+    code: String(existing.code || payload.code || payload.codigo || "").trim() || buildCommercialDevelopmentHistoryCode({ executiveName, interventionAt }),
+    executiveName,
+    campaign: String(payload.campaign || payload.campana || existing.campaign || "").trim(),
+    profile: String(payload.profile || payload.perfil || existing.profile || "").trim(),
+    managementType: String(payload.managementType || payload.tipoGestion || existing.managementType || "").trim(),
+    modality: String(payload.modality || payload.modalidad || existing.modality || "").trim(),
+    generalResult: String(payload.generalResult || payload.resultadoGeneral || existing.generalResult || "").trim(),
+    supervisorName: String(payload.supervisorName || payload.supervisor || existing.supervisorName || existing.supervisor || "").trim(),
+    supervisor: String(payload.supervisor || payload.supervisorName || existing.supervisor || existing.supervisorName || "").trim(),
+    responsibleUser,
+    responsibleName,
+    responsibleRole,
+    trainerName: responsibleName,
+    interventionAt,
+    status,
+    closeReason,
+    initialActiveQ: String(payload.initialActiveQ ?? payload.initialSales ?? existing.initialActiveQ ?? existing.initialSales ?? "").trim(),
+    initialProductivityIn: String(payload.initialProductivityIn ?? payload.initialProductivity ?? existing.initialProductivityIn ?? existing.initialProductivity ?? "").trim(),
+    initialQualityScore: String(payload.initialQualityScore ?? payload.initialConnection ?? existing.initialQualityScore ?? existing.initialConnection ?? "").trim(),
+    initialConnection: String(payload.initialQualityScore ?? payload.initialConnection ?? existing.initialQualityScore ?? existing.initialConnection ?? "").trim(),
+    initialProductivity: String(payload.initialProductivityIn ?? payload.initialProductivity ?? existing.initialProductivityIn ?? existing.initialProductivity ?? "").trim(),
+    dailySales: String(payload.initialActiveQ ?? payload.dailySales ?? payload.initialSales ?? existing.initialActiveQ ?? existing.dailySales ?? existing.initialSales ?? "").trim(),
+    initialSales: String(payload.initialActiveQ ?? payload.initialSales ?? payload.dailySales ?? existing.initialActiveQ ?? existing.initialSales ?? existing.dailySales ?? "").trim(),
+    gaps,
+    reason: gaps.map(gap => gap.name).join("; "),
+    initialObservation: String(payload.initialObservation || payload.observacionInicial || existing.initialObservation || existing.trainerObservations || "").trim(),
+    diagnosticDetail: String(payload.diagnosticDetail || payload.reasonDetail || existing.diagnosticDetail || existing.reasonDetail || "").trim(),
+    reasonDetail: String(payload.reasonDetail || payload.diagnosticDetail || existing.reasonDetail || existing.diagnosticDetail || "").trim(),
+    trainerObservation: String(payload.initialObservation || payload.trainerObservation || payload.trainerObservations || existing.initialObservation || existing.trainerObservation || existing.trainerObservations || "").trim(),
+    trainerObservations: String(payload.initialObservation || payload.trainerObservations || payload.trainerObservation || existing.initialObservation || existing.trainerObservations || existing.trainerObservation || "").trim(),
+    actionTaken: String(payload.actionTaken || existing.actionTaken || "").trim(),
+    expectedResult: String(payload.expectedResult || existing.expectedResult || "").trim(),
+    executiveCommitment: String(payload.executiveCommitment || existing.executiveCommitment || "").trim(),
+    trainerCommitment: String(payload.trainerCommitment || existing.trainerCommitment || "").trim(),
+    followInitialIndicator: String(payload.followInitialIndicator || payload.followConnection || existing.followInitialIndicator || existing.followConnection || "").trim(),
+    follow48hIndicator: String(payload.follow48hIndicator || payload.followProductivity || existing.follow48hIndicator || existing.followProductivity || "").trim(),
+    followConnection: String(payload.finalQualityScore ?? payload.followConnection ?? payload.followInitialIndicator ?? existing.finalQualityScore ?? existing.followConnection ?? existing.followInitialIndicator ?? "").trim(),
+    followProductivity: String(payload.finalProductivityIn ?? payload.followProductivity ?? payload.follow48hIndicator ?? existing.finalProductivityIn ?? existing.followProductivity ?? existing.follow48hIndicator ?? "").trim(),
+    followSales: String(payload.finalActiveQ ?? payload.followSales ?? existing.finalActiveQ ?? existing.followSales ?? "").trim(),
+    followResult: String(payload.followResult || existing.followResult || "").trim(),
+    followComments: String(payload.followComments || existing.followComments || "").trim(),
+    finalActiveQ: String(payload.finalActiveQ ?? payload.followSales ?? existing.finalActiveQ ?? existing.followSales ?? "").trim(),
+    finalProductivityIn: String(payload.finalProductivityIn ?? payload.followProductivity ?? existing.finalProductivityIn ?? existing.followProductivity ?? "").trim(),
+    finalQualityScore: String(payload.finalQualityScore ?? payload.followConnection ?? existing.finalQualityScore ?? existing.followConnection ?? "").trim(),
+    finalComment: String(payload.finalComment || payload.finalObservations || existing.finalComment || existing.finalObservations || "").trim(),
+    finalGapStatuses: typeof payload.finalGapStatuses === "object" && payload.finalGapStatuses ? payload.finalGapStatuses : (existing.finalGapStatuses || {}),
+    finalObservation: String(payload.finalComment || payload.finalObservation || payload.finalObservations || existing.finalComment || existing.finalObservation || existing.finalObservations || "").trim(),
+    finalObservations: String(payload.finalComment || payload.finalObservations || payload.finalObservation || existing.finalComment || existing.finalObservations || existing.finalObservation || "").trim(),
+    finalStatus: String(payload.finalStatus || existing.finalStatus || "").trim(),
+    closedAt: normalizeText(status) === "cerrado" ? (existing.closedAt || now) : ""
+  };
+}
+
+function canViewQualityVariable(user) {
+  return ["admin", "analista", "supervisor"].includes(getRole(user));
+}
+
+function canManageQualityVariable(user) {
+  return ["admin", "analista", "supervisor"].includes(getRole(user));
+}
+
+function ensureEntelQualityVariableScope(payload = {}, currentUser = {}) {
+  const requested = normalizeClientId(payload.clientId || payload.platformId || currentUser.clientId || currentUser.platformId || DEFAULT_CLIENT_ID);
+  if (requested !== DEFAULT_CLIENT_ID) throw new Error("Variable de Calidad esta disponible unicamente para Entel B2B.");
+}
+
+function qualityVariablePeriod(value) {
+  const text = String(value || "").trim();
+  if (/^\d{4}-\d{2}$/.test(text)) return text;
+  const date = text ? new Date(text) : new Date();
+  if (Number.isNaN(date.getTime())) throw new Error("El periodo debe tener formato AAAA-MM.");
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function recordDate(record = {}, fields = []) {
+  for (const field of fields) {
+    const value = record?.[field];
+    if (!value) continue;
+    const date = value instanceof Date ? value : new Date(value);
+    if (!Number.isNaN(date.getTime())) return date;
+    const match = String(value).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (match) return new Date(Number(match[3]), Number(match[2]) - 1, Number(match[1]));
+  }
+  return null;
+}
+
+function recordMatchesQualityPeriod(record, period, dateFields) {
+  const date = recordDate(record, dateFields);
+  return Boolean(date) && `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}` === period;
+}
+
+function qualityMonitorIdentity(record = {}, kind = "evaluation") {
+  const user = kind === "evaluation"
+    ? String(record.auditorId || record.monitorId || record.createdBy || "").trim()
+    : String(record.authorUser || record.analystUser || record.auditorId || record.createdBy || "").trim();
+  const name = kind === "evaluation"
+    ? String(record.auditorNombre || record.monitorName || record.registradoPor || user).trim()
+    : String(record.authorName || record.analystName || record.auditorNombre || record.registradoPor || user).trim();
+  return { user, name: name || user };
+}
+
+function qualityCampaign(record = {}) {
+  return String(record.campaign || record.campana || record.campaignName || "Entel B2B").trim() || "Entel B2B";
+}
+
+function qualityVariableRowId(period, campaign, monitorUser) {
+  return `${period}__${normalizeText(campaign || "todas").replace(/\s+/g, "-")}__${normalizeText(monitorUser).replace(/\s+/g, "-")}`;
+}
+
+async function readQualityVariableConfig() {
+  const saved = await readCachedSharedJson(QUALITY_VARIABLE_CONFIG_KEY, null);
+  return normalizeQualityVariableConfig(saved && typeof saved === "object" ? saved : DEFAULT_QUALITY_VARIABLE_CONFIG);
+}
+
+async function readQualityVariableCalculations() {
+  const rows = await readCachedSharedJson(QUALITY_VARIABLE_CALCULATIONS_KEY, []);
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function writeQualityVariableCalculations(rows) {
+  await writeSharedRecord(QUALITY_VARIABLE_CALCULATIONS_KEY, Array.isArray(rows) ? rows : []);
+  invalidateFirebaseCache(QUALITY_VARIABLE_CALCULATIONS_KEY);
+}
+
+async function appendQualityVariableAudit(currentUser, action, payload = {}) {
+  const audit = await readCachedSharedJson(QUALITY_VARIABLE_AUDIT_KEY, []);
+  const entry = { id: generateNumericId(), clientId: DEFAULT_CLIENT_ID, platformId: DEFAULT_CLIENT_ID, action, user: String(currentUser?.usuario || "").trim(), userName: String(currentUser?.nombre || currentUser?.usuario || "").trim(), timestamp: nowIso(), ...payload };
+  await writeSharedRecord(QUALITY_VARIABLE_AUDIT_KEY, [...(Array.isArray(audit) ? audit : []), entry]);
+  invalidateFirebaseCache(QUALITY_VARIABLE_AUDIT_KEY);
+  return entry;
+}
+
+function buildQualityVariableMonitorOptions({ evaluations, users, savedRows, period }) {
+  const monitorMap = new Map();
+  const addMonitor = ({ user, name }) => {
+    const key = normalizeText(user || name);
+    if (!key) return;
+    const current = monitorMap.get(key) || { monitorUser: user || name, monitorName: name || user, evaluationCount: 0, countsByCampaign: {}, campaigns: new Set() };
+    if (user) current.monitorUser = user;
+    if (name) current.monitorName = name;
+    monitorMap.set(key, current);
+  };
+  (users || []).forEach(user => {
+    if (getRole(user) === "analista" && !["cesado", "inactivo", "inactive", "disabled"].includes(normalizeText(user?.estado))) addMonitor({ user: user.usuario, name: user.nombre || user.usuario });
+  });
+  (evaluations || []).forEach(record => {
+    if (!isRecordVisibleForClient(record, DEFAULT_CLIENT_ID) || !recordMatchesQualityPeriod(record, period, ["fechaEvaluacion", "createdAt", "updatedAt"])) return;
+    const rowCampaign = qualityCampaign(record);
+    const identity = qualityMonitorIdentity(record, "evaluation");
+    addMonitor(identity);
+    const row = monitorMap.get(normalizeText(identity.user || identity.name));
+    if (row) {
+      row.evaluationCount += 1;
+      row.countsByCampaign[rowCampaign] = (row.countsByCampaign[rowCampaign] || 0) + 1;
+      row.campaigns.add(rowCampaign);
+    }
+  });
+  (savedRows || []).forEach(row => addMonitor({ user: row.monitorUser, name: row.monitorName }));
+  return [...monitorMap.values()].map(row => ({ ...row, campaigns: [...row.campaigns] })).sort((a, b) => String(a.monitorName).localeCompare(String(b.monitorName), "es"));
+}
+
+function qualityVariableFinalInputs(row = {}) {
+  const manual = row.manual && typeof row.manual === "object" ? row.manual : {};
+  const automatic = row.automatic && typeof row.automatic === "object" ? row.automatic : {};
+  const stored = row.inputs && typeof row.inputs === "object" ? row.inputs : {};
+  const value = (key, fallback = 0) => Math.max(0, Number(stored[key] ?? manual[key] ?? automatic[key] ?? fallback) || 0);
+  return {
+    evaluations: value("evaluations"),
+    feedbacks: value("feedbacks"),
+    clinics: value("clinics"),
+    inductions: value("inductions"),
+    traction: value("traction")
+  };
+}
+
+function normalizeStoredQualityVariableRow(row = {}, config = DEFAULT_QUALITY_VARIABLE_CONFIG) {
+  const inputs = qualityVariableFinalInputs(row);
+  return {
+    ...row,
+    inputs,
+    manual: { ...(row.manual || {}), ...inputs, tractionSource: row.manual?.tractionSource || "manual" },
+    calculation: row.status === "closed" && row.snapshot?.calculation
+      ? row.snapshot.calculation
+      : (row.calculation || calculateQualityVariable(inputs, config))
+  };
+}
+
+async function loadQualityVariableContext(payload = {}) {
+  const period = qualityVariablePeriod(payload.period);
+  const campaign = String(payload.campaign || "Todas").trim() || "Todas";
+  const [config, evaluations, users, savedRows, audit] = await Promise.all([
+    readQualityVariableConfig(),
+    readEvaluationRecordsFromFirebase(),
+    readCachedSharedJson("users_v1", []),
+    readQualityVariableCalculations(),
+    readCachedSharedJson(QUALITY_VARIABLE_AUDIT_KEY, [])
+  ]);
+  const selectedCampaign = normalizeText(campaign);
+  const rows = savedRows
+    .filter(row => row.period === period && (!selectedCampaign || selectedCampaign === "todas" || normalizeText(row.campaign) === selectedCampaign))
+    .map(row => normalizeStoredQualityVariableRow(row, config))
+    .sort((a, b) => String(a.monitorName).localeCompare(String(b.monitorName), "es"));
+  const monitorOptions = buildQualityVariableMonitorOptions({ evaluations, users, savedRows, period });
+  const campaignOptions = [...new Set([
+    ...monitorOptions.flatMap(item => item.campaigns || []),
+    ...savedRows.map(row => row.campaign).filter(Boolean)
+  ])].sort((a, b) => String(a).localeCompare(String(b), "es"));
+  return { period, campaign, config, rows, monitorOptions, campaignOptions, history: savedRows.map(row => normalizeStoredQualityVariableRow(row, config)), audit: Array.isArray(audit) ? audit : [] };
+}
+
+export const gasHandlers = {
+  async getData(key) {
+    return await readSharedRecord(key);
+  },
+
+  async listUsers() {
+    const users = await readCachedSharedJson("users_v1", []);
+    return Array.isArray(users) ? users : [];
+  },
+
+  async getQualityVariableData(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canViewQualityVariable(currentUser)) throw new Error("No tienes permisos para ver Variable de Calidad.");
+    ensureEntelQualityVariableScope(payload, currentUser);
+    const data = await loadQualityVariableContext(payload);
+    const role = getRole(currentUser);
+    if (role === "analista" && payload.ownOnly === true) {
+      data.rows = data.rows.filter(row => normalizeText(row.monitorUser) === normalizeText(currentUser.usuario) || normalizeText(row.monitorName) === normalizeText(currentUser.nombre));
+    }
+    return data;
+  },
+
+  async saveQualityVariableConfig(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (getRole(currentUser) !== "admin") throw new Error("Solo un administrador puede modificar los parametros de Variable de Calidad.");
+    ensureEntelQualityVariableScope(payload, currentUser);
+    const previous = await readQualityVariableConfig();
+    const validation = validateQualityVariableConfig(payload.config || {});
+    if (!validation.ok) throw new Error(validation.errors.join(" "));
+    const next = { ...validation.config, updatedAt: nowIso(), updatedBy: currentUser.usuario };
+    await writeSharedRecord(QUALITY_VARIABLE_CONFIG_KEY, next);
+    invalidateFirebaseCache(QUALITY_VARIABLE_CONFIG_KEY);
+    await appendQualityVariableAudit(currentUser, "config_updated", { previousValue: previous, newValue: next });
+    return next;
+  },
+
+  async recalculateQualityVariable(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canManageQualityVariable(currentUser)) throw new Error("No tienes permisos para recalcular la variable.");
+    ensureEntelQualityVariableScope(payload, currentUser);
+    throw new Error("El recalculo masivo esta deshabilitado. Crea o edita un calculo individual para el monitor seleccionado.");
+  },
+
+  async saveQualityVariableCalculation(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canManageQualityVariable(currentUser)) throw new Error("No tienes permisos para guardar la variable.");
+    ensureEntelQualityVariableScope(payload, currentUser);
+    const period = qualityVariablePeriod(payload.period);
+    const campaign = String(payload.campaign || "").trim();
+    const monitorUser = String(payload.monitorUser || "").trim();
+    const monitorName = String(payload.monitorName || monitorUser).trim();
+    if (!campaign || normalizeText(campaign) === "todas") throw new Error("Selecciona una campana para el calculo.");
+    if (!monitorUser || !monitorName) throw new Error("Selecciona el monitor que deseas medir.");
+    const config = await readQualityVariableConfig();
+    const input = payload.inputs && typeof payload.inputs === "object" ? payload.inputs : {};
+    const inputs = {
+      evaluations: Math.max(0, Number(input.evaluations) || 0),
+      feedbacks: Math.max(0, Number(input.feedbacks) || 0),
+      clinics: Math.max(0, Number(input.clinics) || 0),
+      inductions: Math.max(0, Number(input.inductions) || 0),
+      traction: Math.max(0, Number(input.traction) || 0)
+    };
+    const id = qualityVariableRowId(period, campaign, monitorUser);
+    const rows = await readQualityVariableCalculations();
+    const index = rows.findIndex(row => row.id === id || (row.period === period && normalizeText(row.monitorUser) === normalizeText(monitorUser) && normalizeText(row.campaign) === normalizeText(campaign)));
+    const previous = index >= 0 ? rows[index] : null;
+    if (previous?.status === "closed") throw new Error("No se puede modificar un calculo cerrado. Un administrador debe reabrirlo primero.");
+    const now = nowIso();
+    const next = {
+      ...(previous || {}),
+      id,
+      clientId: DEFAULT_CLIENT_ID,
+      platformId: DEFAULT_CLIENT_ID,
+      period,
+      campaign,
+      monitorUser,
+      monitorName,
+      automatic: { evaluations: Math.max(0, Number(payload.suggestedEvaluations) || 0) },
+      inputs,
+      manual: { ...(previous?.manual || {}), ...inputs, tractionSource: "manual", updatedAt: now, updatedBy: currentUser.usuario },
+      calculation: calculateQualityVariable(inputs, config),
+      status: "calculated",
+      createdAt: previous?.createdAt || now,
+      createdBy: previous?.createdBy || currentUser.usuario,
+      updatedAt: now,
+      updatedBy: currentUser.usuario
+    };
+    if (index >= 0) rows[index] = next; else rows.push(next);
+    await writeQualityVariableCalculations(rows);
+    await appendQualityVariableAudit(currentUser, previous ? "calculation_updated" : "calculation_created", {
+      calculationId: id,
+      period,
+      campaign,
+      monitorUser,
+      previousValue: previous ? qualityVariableFinalInputs(previous) : null,
+      newValue: inputs
+    });
+    return next;
+  },
+
+  async saveQualityVariableAdjustment(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canManageQualityVariable(currentUser)) throw new Error("No tienes permisos para ajustar la variable.");
+    ensureEntelQualityVariableScope(payload, currentUser);
+    const reason = String(payload.reason || "").trim();
+    if (!reason) throw new Error("El motivo del ajuste es obligatorio.");
+    const context = await loadQualityVariableContext(payload);
+    const target = context.rows.find(row => row.id === payload.id);
+    if (!target) throw new Error("No se encontro el calculo del monitor.");
+    if (target.status === "closed") throw new Error("No se puede modificar un periodo cerrado.");
+    const currentInputs = qualityVariableFinalInputs(target);
+    const manual = {
+      evaluations: Math.max(0, Number(payload.manual?.evaluations ?? currentInputs.evaluations) || 0),
+      feedbacks: Math.max(0, Number(payload.manual?.feedbacks ?? currentInputs.feedbacks) || 0),
+      clinics: Math.max(0, Number(payload.manual?.clinics ?? currentInputs.clinics) || 0),
+      inductions: Math.max(0, Number(payload.manual?.inductions ?? currentInputs.inductions) || 0),
+      traction: Math.max(0, Number(payload.manual?.traction ?? currentInputs.traction) || 0),
+      tractionSource: String(payload.manual?.tractionSource || "manual"),
+      updatedAt: nowIso(),
+      updatedBy: currentUser.usuario,
+      reason
+    };
+    const inputs = { evaluations: manual.evaluations, feedbacks: manual.feedbacks, clinics: manual.clinics, inductions: manual.inductions, traction: manual.traction };
+    const next = { ...target, inputs, manual, calculation: calculateQualityVariable(inputs, context.config), status: "calculated", updatedAt: nowIso() };
+    const rows = await readQualityVariableCalculations();
+    const index = rows.findIndex(row => row.id === target.id);
+    if (index >= 0) rows[index] = next; else rows.push(next);
+    await writeQualityVariableCalculations(rows);
+    await appendQualityVariableAudit(currentUser, "manual_adjustment", { calculationId: target.id, period: target.period, monitorUser: target.monitorUser, previousValue: target.manual || null, newValue: manual, reason });
+    return next;
+  },
+
+  async closeQualityVariable(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canManageQualityVariable(currentUser)) throw new Error("No tienes permisos para cerrar la variable.");
+    ensureEntelQualityVariableScope(payload, currentUser);
+    const context = await loadQualityVariableContext(payload);
+    const target = context.rows.find(row => row.id === payload.id);
+    if (!target?.monitorUser || !target?.period) throw new Error("No se puede cerrar un calculo sin monitor y periodo.");
+    if (target.status === "closed") throw new Error("Este calculo ya se encuentra cerrado.");
+    const closedAt = nowIso();
+    const next = { ...target, status: "closed", closedAt, closedBy: currentUser.usuario, snapshot: { parameters: { ...context.config }, automatic: { ...target.automatic }, manual: { ...target.manual }, calculation: target.calculation, closedAt, closedBy: currentUser.usuario } };
+    const rows = await readQualityVariableCalculations();
+    if (rows.some(row => row.id === target.id && row.status === "closed")) throw new Error("Ya existe un cierre para este monitor, campana y periodo.");
+    const index = rows.findIndex(row => row.id === target.id);
+    if (index >= 0) rows[index] = next; else rows.push(next);
+    await writeQualityVariableCalculations(rows);
+    await appendQualityVariableAudit(currentUser, "closed", { calculationId: target.id, period: target.period, monitorUser: target.monitorUser, newValue: next.snapshot });
+    return next;
+  },
+
+  async reopenQualityVariable(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (getRole(currentUser) !== "admin") throw new Error("Solo un administrador puede reabrir un calculo cerrado.");
+    ensureEntelQualityVariableScope(payload, currentUser);
+    const reason = String(payload.reason || "").trim();
+    if (!reason) throw new Error("El motivo de reapertura es obligatorio.");
+    const rows = await readQualityVariableCalculations();
+    const index = rows.findIndex(row => row.id === payload.id);
+    if (index < 0 || rows[index].status !== "closed") throw new Error("No se encontro un calculo cerrado para reabrir.");
+    const previous = rows[index];
+    rows[index] = { ...previous, status: "calculated", reopenedAt: nowIso(), reopenedBy: currentUser.usuario, reopenReason: reason, snapshot: previous.snapshot };
+    await writeQualityVariableCalculations(rows);
+    await appendQualityVariableAudit(currentUser, "reopened", { calculationId: previous.id, period: previous.period, monitorUser: previous.monitorUser, reason });
+    return rows[index];
+  },
+
+  async deleteQualityVariable(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (getRole(currentUser) !== "admin") throw new Error("Solo un administrador puede eliminar un calculo de Variable de Calidad.");
+    ensureEntelQualityVariableScope(payload, currentUser);
+    const calculationId = String(payload.id || "").trim();
+    if (!calculationId) throw new Error("No se recibio el identificador del calculo que deseas eliminar.");
+    const rows = await readQualityVariableCalculations();
+    const index = rows.findIndex(row => String(row?.id || "") === calculationId);
+    if (index < 0) throw new Error("No se encontro el calculo de Variable de Calidad.");
+    const [deleted] = rows.splice(index, 1);
+    await writeQualityVariableCalculations(rows);
+    await appendQualityVariableAudit(currentUser, "deleted", {
+      calculationId: deleted.id,
+      period: deleted.period,
+      campaign: deleted.campaign,
+      monitorUser: deleted.monitorUser,
+      previousValue: deleted
+    });
+    return { ok: true, id: calculationId };
+  },
+
+  async saveData(key, value) {
+    const result = await writeSharedRecord(key, String(value || ""));
+    invalidateFirebaseCache(key);
+    return result;
+  },
+
+  async deleteData(key) {
+    return await deleteSharedRecord(key);
+  },
+
+  async listData(prefix = "") {
+    const keys = await listSharedKeys(prefix);
+    return keys.map(key => ({ key }));
+  },
+
+  async getCalibrationData(currentUser = {}) {
+    if (!canViewCalibrationModule(currentUser)) throw new Error("No tienes permisos para ver calibraciones.");
+    const requestedClientId = normalizeClientId(currentUser.clientId || currentUser.platformId || currentUser.tenantId);
+    const requestedClientName = String(currentUser.clientName || currentUser.platformName || "").trim();
+    const [sessions, participants, evaluations, evaluationItems, results, comparisonRows, logs] = await Promise.all([
+      readCalibrationCollection(CALIBRATION_SESSIONS_KEY),
+      readCalibrationCollection(CALIBRATION_PARTICIPANTS_KEY),
+      readCalibrationCollection(CALIBRATION_EVALUATIONS_KEY),
+      readCalibrationCollection(CALIBRATION_EVALUATION_ITEMS_KEY),
+      readCalibrationCollection(CALIBRATION_RESULTS_KEY),
+      readCalibrationCollection(CALIBRATION_COMPARISON_KEY),
+      readCalibrationCollection(CALIBRATION_ACTIVITY_LOGS_KEY)
+    ]);
+    const enrichedSessions = sessions
+      .filter(session => isRecordVisibleForClient(session, requestedClientId))
+      .map(session => {
+        const sessionClientId = getRecordClientId(session);
+        const sessionClientName = String(session.clientName || session.platformName || requestedClientName || "").trim();
+        let sessionParticipants = participants.filter(item => normalizeId(item.calibration_session_id) === normalizeId(session.id));
+        const expertId = String(session.expert_referent_id || "").trim();
+        if (expertId && !sessionParticipants.some(item => String(item.user_id || "") === expertId)) {
+          sessionParticipants = [
+            buildCalibrationParticipantRecord(session.id, {
+              usuario: expertId,
+              nombre: session.expert_referent_name || expertId,
+              rol: "referente_experto"
+            }, { is_expert_referent: true, clientId: sessionClientId, clientName: sessionClientName }),
+            ...sessionParticipants
+          ];
+        }
+        sessionParticipants = sessionParticipants.map(item => withClientScope(
+          String(item.user_id || "") === expertId ? { ...item, is_expert_referent: true } : item,
+          sessionClientId,
+          sessionClientName
+        ));
+        const sessionEvaluations = evaluations.filter(item => normalizeId(item.calibration_session_id) === normalizeId(session.id));
+        const savedResults = results.filter(item => normalizeId(item.calibration_session_id) === normalizeId(session.id));
+        const savedComparisonRows = comparisonRows.filter(item => normalizeId(item.calibration_session_id) === normalizeId(session.id));
+        const analytics = buildTransientCalibrationResults(session, sessionEvaluations, savedResults, savedComparisonRows);
+        return {
+          ...withClientScope(session, sessionClientId, sessionClientName),
+          participants: sessionParticipants,
+          evaluations: sessionEvaluations.map(item => withClientScope(item, sessionClientId, sessionClientName)),
+          evaluationItems: evaluationItems.filter(item => normalizeId(item.calibration_session_id) === normalizeId(session.id)).map(item => withClientScope(item, sessionClientId, sessionClientName)),
+          results: analytics.results,
+          comparisonRows: analytics.comparisonRows,
+          logs: logs.filter(item => normalizeId(item.calibration_session_id) === normalizeId(session.id)).map(item => withClientScope(item, sessionClientId, sessionClientName))
+        };
+      })
+      .filter(session => canUserSeeCalibration(session, currentUser))
+      .sort((a, b) => new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0));
+    return {
+      sessions: enrichedSessions,
+      participants: participants.filter(item => isRecordVisibleForClient(item, requestedClientId)),
+      evaluations: evaluations.filter(item => isRecordVisibleForClient(item, requestedClientId)),
+      evaluationItems: evaluationItems.filter(item => isRecordVisibleForClient(item, requestedClientId)),
+      results: results.filter(item => isRecordVisibleForClient(item, requestedClientId)),
+      comparisonRows: comparisonRows.filter(item => isRecordVisibleForClient(item, requestedClientId)),
+      logs: logs.filter(item => isRecordVisibleForClient(item, requestedClientId))
+    };
+  },
+
+  async saveCalibrationSession(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canManageCalibration(currentUser)) throw new Error("Solo admin o analista pueden crear calibraciones.");
+    const sessions = await readCalibrationCollection(CALIBRATION_SESSIONS_KEY);
+    const participants = await readCalibrationCollection(CALIBRATION_PARTICIPANTS_KEY);
+    const id = normalizeId(payload.id || payload.calibration_session_id) || String(generateNumericId());
+    const existing = sessions.find(item => normalizeId(item.id) === id) || {};
+    const clientId = normalizeClientId(payload.clientId || payload.platformId || payload.tenantId || existing.clientId || existing.platformId || currentUser.clientId || currentUser.platformId);
+    const clientName = String(payload.clientName || payload.platformName || existing.clientName || existing.platformName || currentUser.clientName || currentUser.platformName || "").trim();
+    if (existing.id && ["closed_results", "annulled"].includes(normalizeCalibrationStatus(existing.status)) && getRole(currentUser) !== "admin") {
+      throw new Error("Solo un administrador puede corregir una calibracion cerrada o anulada.");
+    }
+    const rawParticipants = Array.isArray(payload.participants) ? payload.participants : [];
+    let selectedParticipants = rawParticipants
+      .filter(item => item && String(item.user_id || item.usuario || "").trim())
+      .map(item => buildCalibrationParticipantRecord(id, item, { clientId, clientName }));
+    const expertId = String(payload.expert_referent_id || payload.expertReferentId || "").trim();
+    if (expertId && !selectedParticipants.some(item => String(item.user_id) === expertId)) {
+      selectedParticipants = [
+        buildCalibrationParticipantRecord(id, {
+          usuario: expertId,
+          nombre: payload.expert_referent_name || existing.expert_referent_name || expertId,
+          rol: payload.expert_referent_role || "referente_experto",
+          area: payload.expert_referent_area || ""
+        }, { is_expert_referent: true, clientId, clientName }),
+        ...selectedParticipants
+      ];
+    } else {
+      selectedParticipants = selectedParticipants.map(item => withClientScope(
+        String(item.user_id) === expertId ? { ...item, is_expert_referent: true } : item,
+        clientId,
+        clientName
+      ));
+    }
+    const evaluationType = normalizeEvaluationFormType(payload.evaluation_type || payload.audio_type || "venta");
+    let session = {
+      ...existing,
+      id,
+      clientId,
+      platformId: clientId,
+      clientName,
+      platformName: clientName,
+      title: String(payload.title || existing.title || "").trim(),
+      description: String(payload.description || existing.description || "").trim(),
+      calibration_objective: String(payload.calibration_objective || existing.calibration_objective || "").trim(),
+      evaluation_type: evaluationType,
+      audio_url: payload.audio_url || existing.audio_url || "",
+      audio_file: payload.audio_file || existing.audio_file || null,
+      call_date: String(payload.call_date || existing.call_date || "").trim(),
+      call_time: String(payload.call_time || existing.call_time || "").trim(),
+      campaign_name: String(payload.campaign_name || existing.campaign_name || "").trim(),
+      evaluated_agent_name: String(payload.evaluated_agent_name || existing.evaluated_agent_name || "").trim(),
+      call_identifier: String(payload.call_identifier || existing.call_identifier || "").trim(),
+      audio_type: evaluationType,
+      call_typification: String(payload.call_typification || existing.call_typification || "").trim(),
+      call_result: String(payload.call_result || existing.call_result || "").trim(),
+      initial_case_observation: String(payload.initial_case_observation || existing.initial_case_observation || "").trim(),
+      scheduled_date: payload.scheduled_date || existing.scheduled_date || "",
+      status: normalizeCalibrationStatus(payload.status || existing.status || "draft"),
+      created_by: existing.created_by || currentUser.usuario,
+      created_by_name: existing.created_by_name || currentUser.nombre,
+      expert_referent_id: expertId,
+      expert_referent_name: String(payload.expert_referent_name || existing.expert_referent_name || "").trim(),
+      created_at: existing.created_at || nowIso(),
+      updated_at: nowIso(),
+      closed_at: existing.closed_at || ""
+    };
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+    if (attachments.length) {
+      const storageResult = await uploadAttachmentsWithFirebaseFallback({ id, calibrationId: id, type: "calibration_audio" }, attachments);
+      const audioFile = (storageResult.savedFiles || [])[0] || null;
+      if (audioFile) {
+        session = {
+          ...session,
+          audio_file: audioFile,
+          audio_url: audioFile.previewUrl || audioFile.downloadUrl || audioFile.publicUrl || audioFile.url || "",
+          storageWarning: storageResult.storageWarning || ""
+        };
+      }
+    }
+    const nextSessions = upsertById(sessions, session);
+    const nextParticipants = [
+      ...participants.filter(item => normalizeId(item.calibration_session_id) !== id),
+      ...selectedParticipants
+    ];
+    await writeCalibrationCollection(CALIBRATION_SESSIONS_KEY, nextSessions);
+    await writeCalibrationCollection(CALIBRATION_PARTICIPANTS_KEY, nextParticipants);
+    await addCalibrationLog(id, currentUser, existing.id ? "session_updated" : "session_created", existing.id ? "Se actualizo la calibracion." : "Se creo la calibracion.", { clientId, clientName });
+    return { ...session, participants: selectedParticipants };
+  },
+
+  async deleteCalibrationSession(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin"], "Solo un administrador puede eliminar calibraciones.");
+    const id = normalizeId(payload.id || payload.calibration_session_id);
+    if (!id) throw new Error("Id de calibracion requerido.");
+    const collections = await Promise.all([
+      readCalibrationCollection(CALIBRATION_SESSIONS_KEY),
+      readCalibrationCollection(CALIBRATION_PARTICIPANTS_KEY),
+      readCalibrationCollection(CALIBRATION_EVALUATIONS_KEY),
+      readCalibrationCollection(CALIBRATION_EVALUATION_ITEMS_KEY),
+      readCalibrationCollection(CALIBRATION_RESULTS_KEY),
+      readCalibrationCollection(CALIBRATION_COMPARISON_KEY),
+      readCalibrationCollection(CALIBRATION_ACTIVITY_LOGS_KEY)
+    ]);
+    const [sessions, participants, evaluations, evaluationItems, results, comparisonRows, logs] = collections;
+    const session = sessions.find(item => normalizeId(item.id) === id);
+    if (!session) throw new Error("No se encontro la calibracion.");
+    await Promise.all([
+      writeCalibrationCollection(CALIBRATION_SESSIONS_KEY, sessions.filter(item => normalizeId(item.id) !== id)),
+      writeCalibrationCollection(CALIBRATION_PARTICIPANTS_KEY, participants.filter(item => normalizeId(item.calibration_session_id) !== id)),
+      writeCalibrationCollection(CALIBRATION_EVALUATIONS_KEY, evaluations.filter(item => normalizeId(item.calibration_session_id) !== id)),
+      writeCalibrationCollection(CALIBRATION_EVALUATION_ITEMS_KEY, evaluationItems.filter(item => normalizeId(item.calibration_session_id) !== id)),
+      writeCalibrationCollection(CALIBRATION_RESULTS_KEY, results.filter(item => normalizeId(item.calibration_session_id) !== id)),
+      writeCalibrationCollection(CALIBRATION_COMPARISON_KEY, comparisonRows.filter(item => normalizeId(item.calibration_session_id) !== id)),
+      writeCalibrationCollection(CALIBRATION_ACTIVITY_LOGS_KEY, logs.filter(item => normalizeId(item.calibration_session_id) !== id))
+    ]);
+    return { ok: true, id, title: session.title || "" };
+  },
+
+  async updateCalibrationStatus(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canManageCalibration(currentUser)) throw new Error("Solo admin o analista pueden cambiar el estado de una calibracion.");
+    const id = normalizeId(payload.id || payload.calibration_session_id);
+    if (!id) throw new Error("Id de calibracion requerido.");
+    const sessions = await readCalibrationCollection(CALIBRATION_SESSIONS_KEY);
+    const session = sessions.find(item => normalizeId(item.id) === id);
+    if (!session) throw new Error("No se encontro la calibracion.");
+    const clientId = getRecordClientId(session);
+    const clientName = String(session.clientName || session.platformName || "").trim();
+    const nextStatus = normalizeCalibrationStatus(payload.status);
+    if (nextStatus === "live") {
+      let sessionParticipants = (await readCalibrationCollection(CALIBRATION_PARTICIPANTS_KEY)).filter(item => normalizeId(item.calibration_session_id) === id);
+      const expertId = String(session.expert_referent_id || "").trim();
+      if (expertId && !sessionParticipants.some(item => String(item.user_id || "") === expertId)) {
+        sessionParticipants = [buildCalibrationParticipantRecord(id, { usuario: expertId, nombre: session.expert_referent_name || expertId, rol: "referente_experto" }, { is_expert_referent: true, clientId, clientName }), ...sessionParticipants];
+      }
+      validateCalibrationCanStart({ ...session, participants: sessionParticipants });
+    }
+    let resultsPayload = null;
+    if (nextStatus === "closed_results") {
+      resultsPayload = await recomputeCalibrationResults(id);
+    }
+    const updated = {
+      ...session,
+      clientId,
+      platformId: clientId,
+      clientName,
+      platformName: clientName,
+      status: nextStatus,
+      updated_at: nowIso(),
+      closed_at: nextStatus === "closed_results" ? nowIso() : session.closed_at || ""
+    };
+    await writeCalibrationCollection(CALIBRATION_SESSIONS_KEY, upsertById(sessions, updated));
+    await addCalibrationLog(id, currentUser, `status_${nextStatus}`, `Estado actualizado a ${nextStatus}.`, { clientId, clientName });
+    return { ...updated, ...(resultsPayload || {}) };
+  },
+
+  async submitCalibrationEvaluation(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    const sessionId = normalizeId(payload.calibration_session_id || payload.sessionId);
+    if (!sessionId) throw new Error("Id de calibracion requerido.");
+    const sessions = await readCalibrationCollection(CALIBRATION_SESSIONS_KEY);
+    const session = sessions.find(item => normalizeId(item.id) === sessionId);
+    if (!session) throw new Error("No se encontro la calibracion.");
+    const clientId = getRecordClientId(session);
+    const clientName = String(session.clientName || session.platformName || "").trim();
+    const status = normalizeCalibrationStatus(session.status);
+    if (status !== "live") throw new Error("Solo se puede enviar una evaluacion cuando la calibracion esta En vivo.");
+    const participants = await readCalibrationCollection(CALIBRATION_PARTICIPANTS_KEY);
+    const userId = String(currentUser.usuario || "").trim();
+    const isExpert = String(session.expert_referent_id || "") === userId;
+    const assigned = participants.find(item => normalizeId(item.calibration_session_id) === sessionId && String(item.user_id) === userId);
+    if (!isExpert && !assigned && !canManageCalibration(currentUser)) throw new Error("No estas asignado a esta calibracion.");
+    const evaluations = await readCalibrationCollection(CALIBRATION_EVALUATIONS_KEY);
+    const existing = evaluations.find(item => normalizeId(item.calibration_session_id) === sessionId && String(item.user_id) === userId);
+    if (existing?.locked && !canManageCalibration(currentUser)) throw new Error("Tu evaluacion ya fue enviada y esta bloqueada.");
+    const evaluationId = existing?.id || `${sessionId}_${userId}`;
+    const score = calculateCalibrationScore(payload.sections || payload.secciones || [], payload.zeroToleranceItems || [], session.evaluation_type);
+    const normalizedEvaluation = {
+      ...(existing || {}),
+      id: evaluationId,
+      calibration_session_id: sessionId,
+      clientId,
+      platformId: clientId,
+      clientName,
+      platformName: clientName,
+      user_id: userId,
+      user_name: currentUser.nombre || payload.user_name || "",
+      role: getRole(currentUser),
+      area: getUserCalibrationArea(currentUser),
+      is_expert_referent: Boolean(isExpert),
+      total_score: Number(score.pct.toFixed(1)),
+      selected_typification: String(payload.selected_typification || payload.typification || "").trim(),
+      general_observation: String(payload.general_observation || "").trim(),
+      sections: normalizeEvaluationSections(payload.sections || payload.secciones || [], session.evaluation_type),
+      zeroToleranceItems: Array.isArray(payload.zeroToleranceItems) ? payload.zeroToleranceItems : [],
+      submitted: true,
+      submitted_at: nowIso(),
+      locked: true,
+      created_at: existing?.created_at || nowIso(),
+      updated_at: nowIso()
+    };
+    await writeCalibrationCollection(CALIBRATION_EVALUATIONS_KEY, upsertById(evaluations, normalizedEvaluation));
+    const allEvaluationItems = await readCalibrationCollection(CALIBRATION_EVALUATION_ITEMS_KEY);
+    const itemRows = buildCalibrationItemRows(evaluationId, normalizedEvaluation.sections, session.evaluation_type, { clientId, clientName }).map(item => ({
+      ...item,
+      calibration_session_id: sessionId,
+      user_id: userId,
+      is_expert_referent: Boolean(isExpert)
+    }));
+    await writeCalibrationCollection(CALIBRATION_EVALUATION_ITEMS_KEY, [
+      ...allEvaluationItems.filter(item => normalizeId(item.calibration_evaluation_id) !== normalizeId(evaluationId)),
+      ...itemRows
+    ]);
+    const nextParticipants = participants.map(item => normalizeId(item.calibration_session_id) === sessionId && String(item.user_id) === userId
+      ? withClientScope({ ...item, participation_status: "submitted", submitted_at: normalizedEvaluation.submitted_at }, clientId, clientName)
+      : item
+    );
+    await writeCalibrationCollection(CALIBRATION_PARTICIPANTS_KEY, nextParticipants);
+    await addCalibrationLog(sessionId, currentUser, "evaluation_submitted", `${currentUser.nombre || userId} envio su evaluacion de calibracion.`, { clientId, clientName });
+    return { ...normalizedEvaluation, items: itemRows };
+  },
+
+  async getBootstrapData() {
+    const [
+      users,
+      historico,
+      staffing,
+      feedbackRecords,
+      evaluationRecords,
+      noTipificationRecords,
+      legendConcepts,
+      operationalIncidents,
+      communications,
+      chatMessages
+    ] = await Promise.all([
+      readCachedSharedJson("users_v1", []),
+      readCachedSharedJson("snapshots_shared", []),
+      readCachedSharedJson("staffing", []),
+      readCachedSharedJson(FEEDBACK_KEY, []),
+      readEvaluationRecordsFromFirebase(),
+      readCachedSharedJson("notip_records_v1", []),
+      readCachedSharedJson("legend_concepts_v1", []),
+      readCachedSharedJson(OPERATIONAL_INCIDENTS_KEY, []),
+      readCachedSharedJson(COMMUNICATIONS_KEY, []),
+      readCachedSharedJson("internal_chat_v1", [])
+    ]);
+    const result = {
+      ok: true,
+      source: "local_node_firebase",
+      users: Array.isArray(users) ? users : [],
+      historico: Array.isArray(historico) ? historico : [],
+      staffing: Array.isArray(staffing) ? staffing : [],
+      feedbackRecords: Array.isArray(feedbackRecords) ? feedbackRecords : [],
+      evaluationRecords: Array.isArray(evaluationRecords) ? evaluationRecords : [],
+      noTipificationRecords: Array.isArray(noTipificationRecords) ? noTipificationRecords : [],
+      legendConcepts: Array.isArray(legendConcepts) ? legendConcepts : [],
+      operationalIncidents: Array.isArray(operationalIncidents) ? operationalIncidents : [],
+      communications: Array.isArray(communications) ? sortCommunications(communications) : [],
+      chatMessages: Array.isArray(chatMessages) ? chatMessages : [],
+      errors: {}
+    };
+    result.counts = {
+      users: result.users.length,
+      historico: result.historico.length,
+      staffing: result.staffing.length,
+      feedbackRecords: result.feedbackRecords.length,
+      evaluationRecords: result.evaluationRecords.length,
+      noTipificationRecords: result.noTipificationRecords.length,
+      legendConcepts: result.legendConcepts.length,
+      operationalIncidents: result.operationalIncidents.length,
+      communications: result.communications.length,
+      chatMessages: result.chatMessages.length
+    };
+    return result;
+  },
+
+  async getImprovementDashboardDataFast() {
+    const [
+      historico,
+      staffing,
+      feedbackRecords,
+      evaluationRecords,
+      noTipificationRecords,
+      legendConcepts
+    ] = await Promise.all([
+      readCachedSharedJson("snapshots_shared", []),
+      readCachedSharedJson("staffing", []),
+      readCachedSharedJson(FEEDBACK_KEY, []),
+      readEvaluationRecordsFromFirebase(),
+      readCachedSharedJson("notip_records_v1", []),
+      readCachedSharedJson("legend_concepts_v1", [])
+    ]);
+    const result = {
+      ok: true,
+      source: "local_node_firebase_fast",
+      historico: Array.isArray(historico) ? historico : [],
+      staffing: Array.isArray(staffing) ? staffing : [],
+      feedbackRecords: Array.isArray(feedbackRecords) ? feedbackRecords : [],
+      evaluationRecords: Array.isArray(evaluationRecords) ? evaluationRecords : [],
+      noTipificationRecords: Array.isArray(noTipificationRecords) ? noTipificationRecords : [],
+      legendConcepts: Array.isArray(legendConcepts) ? legendConcepts : [],
+      errors: {}
+    };
+    result.counts = {
+      historico: result.historico.length,
+      staffing: result.staffing.length,
+      feedbackRecords: result.feedbackRecords.length,
+      evaluationRecords: result.evaluationRecords.length,
+      noTipificationRecords: result.noTipificationRecords.length,
+      legendConcepts: result.legendConcepts.length
+    };
+    return result;
+  },
+
+  async validateDatabaseHealth() {
+    const startedAt = Date.now();
+    const [
+      users,
+      historico,
+      staffing,
+      feedbackRecords,
+      evaluationRecords,
+      noTipificationRecords,
+      legendConcepts,
+      operationalIncidents,
+      communications,
+      chatMessages,
+      calibrationSessions,
+      calibrationParticipants,
+      calibrationEvaluations,
+      calibrationEvaluationItems,
+      calibrationResults,
+      calibrationComparisonRows,
+      calibrationLogs
+    ] = await Promise.all([
+      readCachedSharedJson("users_v1", []),
+      readCachedSharedJson("snapshots_shared", []),
+      readCachedSharedJson("staffing", []),
+      readCachedSharedJson(FEEDBACK_KEY, []),
+      readEvaluationRecordsFromFirebase(),
+      readCachedSharedJson("notip_records_v1", []),
+      readCachedSharedJson("legend_concepts_v1", []),
+      readCachedSharedJson(OPERATIONAL_INCIDENTS_KEY, []),
+      readCachedSharedJson(COMMUNICATIONS_KEY, []),
+      readCachedSharedJson("internal_chat_v1", []),
+      readCalibrationCollection(CALIBRATION_SESSIONS_KEY),
+      readCalibrationCollection(CALIBRATION_PARTICIPANTS_KEY),
+      readCalibrationCollection(CALIBRATION_EVALUATIONS_KEY),
+      readCalibrationCollection(CALIBRATION_EVALUATION_ITEMS_KEY),
+      readCalibrationCollection(CALIBRATION_RESULTS_KEY),
+      readCalibrationCollection(CALIBRATION_COMPARISON_KEY),
+      readCalibrationCollection(CALIBRATION_ACTIVITY_LOGS_KEY)
+    ]);
+    const counts = {
+      users: Array.isArray(users) ? users.length : 0,
+      historico: Array.isArray(historico) ? historico.length : 0,
+      staffing: Array.isArray(staffing) ? staffing.length : 0,
+      feedbackRecords: Array.isArray(feedbackRecords) ? feedbackRecords.length : 0,
+      evaluationRecords: Array.isArray(evaluationRecords) ? evaluationRecords.length : 0,
+      noTipificationRecords: Array.isArray(noTipificationRecords) ? noTipificationRecords.length : 0,
+      legendConcepts: Array.isArray(legendConcepts) ? legendConcepts.length : 0,
+      operationalIncidents: Array.isArray(operationalIncidents) ? operationalIncidents.length : 0,
+      communications: Array.isArray(communications) ? communications.length : 0,
+      chatMessages: Array.isArray(chatMessages) ? chatMessages.length : 0,
+      calibrationSessions: Array.isArray(calibrationSessions) ? calibrationSessions.length : 0,
+      calibrationParticipants: Array.isArray(calibrationParticipants) ? calibrationParticipants.length : 0,
+      calibrationEvaluations: Array.isArray(calibrationEvaluations) ? calibrationEvaluations.length : 0,
+      calibrationEvaluationItems: Array.isArray(calibrationEvaluationItems) ? calibrationEvaluationItems.length : 0,
+      calibrationResults: Array.isArray(calibrationResults) ? calibrationResults.length : 0,
+      calibrationComparisonRows: Array.isArray(calibrationComparisonRows) ? calibrationComparisonRows.length : 0,
+      calibrationLogs: Array.isArray(calibrationLogs) ? calibrationLogs.length : 0
+    };
+    return {
+      ok: true,
+      source: "firebase_realtime_database",
+      elapsedMs: Date.now() - startedAt,
+      counts
+    };
+  },
+
+  async listNoTipificationRecords() {
+    const records = await readCachedSharedJson("notip_records_v1", []);
+    return Array.isArray(records) ? records : [];
+  },
+
+  async saveNoTipificationRecord(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin", "analista", "supervisor", "formador"], "No tienes permisos para registrar no tipificacion.");
+    const advisorName = String(payload.asesorNombre || payload.advisorName || payload.asesor || "").trim();
+    if (!advisorName) throw new Error("El asesor es obligatorio.");
+    const phoneNumber = String(payload.phoneNumber || payload.phone_number || payload.telefono || "").trim();
+    if (!phoneNumber) throw new Error("El numero de telefono es obligatorio.");
+    const callDateTime = payload.callDateTime || payload.call_date_time || payload.fechaLlamada || "";
+    if (!String(callDateTime || "").trim()) throw new Error("La fecha y hora de la llamada es obligatoria.");
+    const callDuration = String(payload.callDuration || payload.call_duration || payload.duracion || "").trim();
+    if (!callDuration) throw new Error("La duracion de la llamada es obligatoria.");
+    const now = nowIso();
+    const records = await readCachedSharedJson("notip_records_v1", []);
+    const record = {
+      id: normalizeId(payload.id || generateNumericId()),
+      asesorNombre: advisorName,
+      advisorUser: String(payload.advisorUser || payload.advisor_id || "").trim(),
+      supervisor: String(payload.supervisor || "").trim(),
+      coordinador: String(payload.coordinador || "").trim(),
+      antiguedad: Number(payload.antiguedad || 0) || 0,
+      fechaIngreso: String(payload.fechaIngreso || "").trim(),
+      clientId: normalizeClientId(payload.clientId || payload.platformId || payload.tenantId),
+      platformId: normalizeClientId(payload.platformId || payload.clientId || payload.tenantId),
+      clientName: String(payload.clientName || payload.platformName || "").trim(),
+      platformName: String(payload.platformName || payload.clientName || "").trim(),
+      managementTypeRuc: String(payload.managementTypeRuc || payload.campaign_name || payload.campana || "").trim(),
+      phoneNumber,
+      callDateTime: new Date(callDateTime).toString() === "Invalid Date" ? callDateTime : new Date(callDateTime).toISOString(),
+      callDuration,
+      incidentType: "No tipificacion",
+      incidentCategory: "Incidencia operativa",
+      status: "Registrado",
+      createdBy: String(currentUser.usuario || "").trim(),
+      createdByName: String(currentUser.nombre || "").trim(),
+      createdAt: payload.createdAt || now,
+      updatedAt: now
+    };
+    const nextRecords = [record, ...(Array.isArray(records) ? records : [])];
+    await writeSharedRecord("notip_records_v1", nextRecords);
+    invalidateFirebaseCache("notip_records_v1");
+    return record;
+  },
+
+  async listOperationalIncidents() {
+    const records = await readCachedSharedJson(OPERATIONAL_INCIDENTS_KEY, []);
+    return Array.isArray(records) ? records : [];
+  },
+
+  async saveOperationalIncident(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin", "analista", "supervisor", "formador"], "No tienes permisos para registrar incidencias operativas.");
+    const advisorName = String(payload.advisor_name || payload.advisorName || payload.asesorNombre || payload.asesor || "").trim();
+    if (!advisorName) throw new Error("El asesor o ejecutivo relacionado es obligatorio.");
+    const observation = String(payload.observation || payload.observacion || "").trim()
+      || "No se encuentra audio disponible en inConcert para realizar la evaluación de calidad. Se registra la incidencia operativa 'No conectado' para seguimiento correspondiente.";
+    const now = nowIso();
+    const records = await readCachedSharedJson(OPERATIONAL_INCIDENTS_KEY, []);
+    const clientId = normalizeClientId(payload.clientId || payload.platformId || payload.tenantId);
+    const clientName = String(payload.clientName || payload.platformName || "").trim();
+    const record = {
+      id: normalizeId(payload.id || generateNumericId()),
+      clientId,
+      platformId: clientId,
+      clientName,
+      platformName: clientName,
+      advisor_id: String(payload.advisor_id || payload.advisorUser || "").trim(),
+      advisor_name: advisorName,
+      monitor_id: String(currentUser.usuario || payload.monitor_id || "").trim(),
+      monitor_name: String(currentUser.nombre || payload.monitor_name || "").trim(),
+      campaign_id: String(payload.campaign_id || "").trim(),
+      campaign_name: String(payload.campaign_name || payload.campaignName || payload.campana || "").trim(),
+      call_id: String(payload.call_id || payload.callId || payload.case_id || payload.caseId || "").trim(),
+      incident_type: "No conectado",
+      incident_category: "Incidencia operativa",
+      observation,
+      status: "Registrado",
+      created_at: payload.created_at || now,
+      updated_at: now
+    };
+    const nextRecords = [record, ...(Array.isArray(records) ? records : [])];
+    await writeSharedRecord(OPERATIONAL_INCIDENTS_KEY, nextRecords);
+    invalidateFirebaseCache(OPERATIONAL_INCIDENTS_KEY);
+    return record;
+  },
+
+  async updateOperationalIncident(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canEditOperationalIncident(currentUser)) throw new Error("No tienes permisos para editar incidencias operativas.");
+    const id = normalizeId(payload.id);
+    if (!id) throw new Error("El id de la incidencia es obligatorio.");
+    const sourceType = normalizeText(payload.sourceType || payload.source || "");
+    const key = sourceType === "no tipification" || sourceType === "no tipificacion" || sourceType === "no_tipification"
+      ? "notip_records_v1"
+      : OPERATIONAL_INCIDENTS_KEY;
+    const records = await readCachedSharedJson(key, []);
+    const list = Array.isArray(records) ? records : [];
+    const index = list.findIndex(item => normalizeId(item?.id) === id);
+    if (index < 0) throw new Error("No se encontro la incidencia para editar.");
+    const existing = list[index] || {};
+    const now = nowIso();
+    let updated;
+    if (key === "notip_records_v1") {
+      const advisorName = String(payload.asesorNombre || payload.advisorName || payload.advisor_name || existing.asesorNombre || "").trim();
+      if (!advisorName) throw new Error("El asesor es obligatorio.");
+      const phoneNumber = String(payload.phoneNumber || payload.telefono || existing.phoneNumber || "").trim();
+      if (!phoneNumber) throw new Error("El numero de telefono es obligatorio.");
+      const callDateTime = payload.callDateTime || existing.callDateTime || existing.createdAt || "";
+      if (!String(callDateTime || "").trim()) throw new Error("La fecha y hora de la llamada es obligatoria.");
+      const callDuration = String(payload.callDuration || payload.duracion || existing.callDuration || "").trim();
+      if (!callDuration) throw new Error("La duracion de la llamada es obligatoria.");
+      updated = {
+        ...existing,
+        asesorNombre: advisorName,
+        advisorUser: String(payload.advisorUser || payload.advisor_id || existing.advisorUser || "").trim(),
+        supervisor: String(payload.supervisor || existing.supervisor || "").trim(),
+        coordinador: String(payload.coordinador || existing.coordinador || "").trim(),
+        antiguedad: Number(payload.antiguedad ?? existing.antiguedad ?? 0) || 0,
+        fechaIngreso: String(payload.fechaIngreso || existing.fechaIngreso || "").trim(),
+        clientId: normalizeClientId(payload.clientId || payload.platformId || existing.clientId || existing.platformId),
+        platformId: normalizeClientId(payload.platformId || payload.clientId || existing.platformId || existing.clientId),
+        clientName: String(payload.clientName || payload.platformName || existing.clientName || existing.platformName || "").trim(),
+        platformName: String(payload.platformName || payload.clientName || existing.platformName || existing.clientName || "").trim(),
+        managementTypeRuc: String(payload.managementTypeRuc || payload.campaignName || payload.campaign_name || existing.managementTypeRuc || "").trim(),
+        phoneNumber,
+        callDateTime: normalizeDateOrNow(callDateTime),
+        callDuration,
+        incidentType: "No tipificacion",
+        incidentCategory: "Incidencia operativa",
+        status: String(payload.status || existing.status || "Registrado").trim(),
+        updatedAt: now,
+        updatedBy: String(currentUser.usuario || "").trim(),
+        updatedByName: String(currentUser.nombre || "").trim()
+      };
+    } else {
+      const advisorName = String(payload.advisor_name || payload.advisorName || payload.asesorNombre || existing.advisor_name || "").trim();
+      if (!advisorName) throw new Error("El asesor o ejecutivo relacionado es obligatorio.");
+      updated = {
+        ...existing,
+        clientId: normalizeClientId(payload.clientId || payload.platformId || existing.clientId || existing.platformId),
+        platformId: normalizeClientId(payload.platformId || payload.clientId || existing.platformId || existing.clientId),
+        clientName: String(payload.clientName || payload.platformName || existing.clientName || existing.platformName || "").trim(),
+        platformName: String(payload.platformName || payload.clientName || existing.platformName || existing.clientName || "").trim(),
+        advisor_id: String(payload.advisor_id || payload.advisorUser || existing.advisor_id || "").trim(),
+        advisor_name: advisorName,
+        campaign_name: String(payload.campaign_name || payload.campaignName || existing.campaign_name || "").trim(),
+        call_id: String(payload.call_id || payload.callId || existing.call_id || "").trim(),
+        incident_type: "No conectado",
+        incident_category: "Incidencia operativa",
+        observation: String(payload.observation || payload.observacion || existing.observation || "").trim() || existing.observation || "",
+        status: String(payload.status || existing.status || "Registrado").trim(),
+        updated_at: now,
+        updated_by: String(currentUser.usuario || "").trim(),
+        updated_by_name: String(currentUser.nombre || "").trim()
+      };
+    }
+    const nextRecords = list.map(item => normalizeId(item?.id) === id ? updated : item);
+    await writeSharedRecord(key, nextRecords);
+    invalidateFirebaseCache(key);
+    return updated;
+  },
+
+  async deleteOperationalIncident(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canDeleteOperationalIncident(currentUser)) throw new Error("Solo el administrador puede eliminar incidencias operativas.");
+    const id = normalizeId(payload.id);
+    if (!id) throw new Error("El id de la incidencia es obligatorio.");
+    const sourceType = normalizeText(payload.sourceType || payload.source || "");
+    const key = sourceType === "no tipification" || sourceType === "no tipificacion" || sourceType === "no_tipification"
+      ? "notip_records_v1"
+      : OPERATIONAL_INCIDENTS_KEY;
+    const records = await readCachedSharedJson(key, []);
+    const list = Array.isArray(records) ? records : [];
+    const exists = list.some(item => normalizeId(item?.id) === id);
+    if (!exists) throw new Error("No se encontro la incidencia para eliminar.");
+    const nextRecords = list.filter(item => normalizeId(item?.id) !== id);
+    await writeSharedRecord(key, nextRecords);
+    invalidateFirebaseCache(key);
+    return { ok: true, id, sourceType: key === "notip_records_v1" ? "no_tipification" : "operational" };
+  },
+
+  async listSalesValidations(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canViewSalesValidation(currentUser)) throw new Error("No tienes permisos para ver validaciones de ventas.");
+    const records = await readSalesValidations();
+    const role = getRole(currentUser);
+    return records
+      .filter(record => role === "admin" ? true : normalizeText(record?.status) !== "eliminada")
+      .sort((a, b) => new Date(b.updatedAt || b.validationDate || 0).getTime() - new Date(a.updatedAt || a.validationDate || 0).getTime());
+  },
+
+  async saveSalesValidation(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canManageSalesValidation(currentUser)) throw new Error("No tienes permisos para registrar validaciones de ventas.");
+    const records = await readSalesValidations();
+    const id = payload.id ? normalizeId(payload.id) : "";
+    const index = id ? records.findIndex(item => normalizeId(item?.id) === id) : -1;
+    const existing = index >= 0 ? records[index] : {};
+    const normalized = normalizeSalesValidationPayload(payload, existing, currentUser);
+    if (index < 0 || !String(normalized.agentCode || "").trim()) {
+      normalized.agentCode = buildNextSalesAgentCode(normalized.agentName, records);
+    }
+    const duplicateKey = getSalesValidationDuplicateKey(normalized);
+    const duplicated = records.find(item =>
+      normalizeId(item?.id) !== normalizeId(normalized.id) &&
+      normalizeText(item?.status) !== "eliminada" &&
+      getSalesValidationDuplicateKey(item) === duplicateKey
+    );
+    if (duplicated) throw new Error("Ya existe una validacion para el mismo RUC, fecha de venta y numero de llamada.");
+
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+    let record = normalized;
+    const uploadedFiles = Array.isArray(payload.uploadedFiles) ? payload.uploadedFiles.filter(Boolean) : [];
+    if (uploadedFiles.length) {
+      record = buildFileFieldsFromSavedFiles(record, mergeFilesByIdentity(record.files, uploadedFiles), {ok:true,savedFiles:uploadedFiles});
+      record.attachmentStatus = "completo";
+    }
+    if (attachments.length) {
+      const storageResult = await uploadAttachmentsWithFirebaseFallback(
+        { id: record.id, salesValidationId: record.id, type: "sales_validation" },
+        attachments
+      );
+      record = buildFileFieldsFromSavedFiles(
+        record,
+        mergeFilesByIdentity(record.files, storageResult.savedFiles || []),
+        storageResult
+      );
+      record.attachmentStatus = storageResult.ok ? "completo" : "pendiente";
+    }
+
+    const action = index >= 0 ? "updated" : "created";
+    const auditEntries = action === "created"
+      ? buildSalesValidationAudit({}, record, currentUser, "created")
+      : buildSalesValidationAudit(existing, record, currentUser, "updated");
+    record.auditTrail = [...(Array.isArray(existing.auditTrail) ? existing.auditTrail : []), ...auditEntries];
+    const nextRecords = index >= 0
+      ? records.map(item => normalizeId(item?.id) === normalizeId(record.id) ? record : item)
+      : [record, ...records];
+    await writeSalesValidations(nextRecords);
+    return record;
+  },
+
+  async deleteSalesValidation(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canDeleteSalesValidation(currentUser)) throw new Error("Solo el administrador puede eliminar validaciones de ventas.");
+    const id = normalizeId(payload.id);
+    const reason = String(payload.reason || payload.motivo || "").trim();
+    if (!id) throw new Error("El id de la validacion es obligatorio.");
+    if (!reason) throw new Error("El motivo de eliminacion es obligatorio.");
+    const records = await readSalesValidations();
+    const index = records.findIndex(item => normalizeId(item?.id) === id);
+    if (index < 0) throw new Error("No se encontro la ficha de validacion.");
+    const now = nowIso();
+    const existing = records[index];
+    const record = {
+      ...existing,
+      status: "Eliminada",
+      deletedAt: now,
+      deletedBy: String(currentUser.usuario || "").trim(),
+      deletedByName: String(currentUser.nombre || "").trim(),
+      deleteReason: reason,
+      updatedAt: now,
+      updatedBy: String(currentUser.usuario || "").trim(),
+      updatedByName: String(currentUser.nombre || "").trim(),
+      auditTrail: [
+        ...(Array.isArray(existing.auditTrail) ? existing.auditTrail : []),
+        ...buildSalesValidationAudit(existing, existing, currentUser, "deleted", { reason })
+      ]
+    };
+    const nextRecords = records.map(item => normalizeId(item?.id) === id ? record : item);
+    await writeSalesValidations(nextRecords);
+    return record;
+  },
+
+  async restoreSalesValidation(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin"], "Solo el administrador puede restaurar validaciones.");
+    const id = normalizeId(payload.id);
+    const records = await readSalesValidations();
+    const index = records.findIndex(item => normalizeId(item?.id) === id);
+    if (index < 0) throw new Error("No se encontro la ficha de validacion.");
+    const now = nowIso();
+    const existing = records[index];
+    const record = {
+      ...existing,
+      status: "Activa",
+      restoredAt: now,
+      restoredBy: String(currentUser.usuario || "").trim(),
+      restoredByName: String(currentUser.nombre || "").trim(),
+      updatedAt: now,
+      updatedBy: String(currentUser.usuario || "").trim(),
+      updatedByName: String(currentUser.nombre || "").trim(),
+      auditTrail: [
+        ...(Array.isArray(existing.auditTrail) ? existing.auditTrail : []),
+        ...buildSalesValidationAudit(existing, existing, currentUser, "restored")
+      ]
+    };
+    const nextRecords = records.map(item => normalizeId(item?.id) === id ? record : item);
+    await writeSalesValidations(nextRecords);
+    return record;
+  },
+
+  async listCommercialDevelopment(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser || payload);
+    if (!canViewCommercialDevelopment(currentUser)) throw new Error("No tienes permisos para ver desarrollo comercial.");
+    const clientId = normalizeClientId(payload.clientId || payload.platformId || currentUser.clientId || currentUser.platformId);
+    if (clientId !== COMMERCIAL_DEVELOPMENT_CLIENT_ID) return [];
+    const records = await readCommercialDevelopmentRecords();
+    const role = getRole(currentUser);
+    return records
+      .filter(record => isRecordVisibleForClient(record, COMMERCIAL_DEVELOPMENT_CLIENT_ID))
+      .map(record => ({ ...record, status: normalizeCommercialDevelopmentStatus(record) }))
+      .filter(record => role === "admin" ? true : normalizeText(record?.status) !== "eliminada")
+      .sort((a, b) => new Date(b.updatedAt || b.interventionAt || b.createdAt || 0).getTime() - new Date(a.updatedAt || a.interventionAt || a.createdAt || 0).getTime());
+  },
+
+  async saveCommercialDevelopment(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canManageCommercialDevelopment(currentUser)) throw new Error("No tienes permisos para registrar desarrollo comercial.");
+    const records = await readCommercialDevelopmentRecords();
+    const id = payload.id ? normalizeId(payload.id) : "";
+    const index = id ? records.findIndex(item => normalizeId(item?.id) === id) : -1;
+    const existing = index >= 0 ? records[index] : {};
+    if (index >= 0 && normalizeText(existing.status) === "eliminada") throw new Error("No se puede editar una ficha eliminada.");
+    const recordBase = normalizeCommercialDevelopmentPayload(payload, existing, currentUser, records);
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+    let record = recordBase;
+    if (attachments.length) {
+      const storageResult = await uploadAttachmentsWithFirebaseFallback(
+        { id: record.id, commercialDevelopmentId: record.id, type: "commercial_development" },
+        attachments
+      );
+      record = buildFileFieldsFromSavedFiles(
+        record,
+        mergeFilesByIdentity(record.files, storageResult.savedFiles || []),
+        storageResult
+      );
+      record.attachmentStatus = storageResult.ok ? "completo" : "pendiente";
+    }
+    const nextRecords = index >= 0
+      ? records.map(item => normalizeId(item?.id) === normalizeId(record.id) ? record : item)
+      : [record, ...records];
+    await writeCommercialDevelopmentRecords(nextRecords);
+    return record;
+  },
+
+  async deleteCommercialDevelopment(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    if (!canDeleteCommercialDevelopment(currentUser)) throw new Error("Solo el administrador puede eliminar fichas de desarrollo comercial.");
+    const id = normalizeId(payload.id);
+    if (!id) throw new Error("El id de la ficha es obligatorio.");
+    const records = await readCommercialDevelopmentRecords();
+    const index = records.findIndex(item => normalizeId(item?.id) === id);
+    if (index < 0) throw new Error("No se encontro la ficha de desarrollo comercial.");
+    const now = nowIso();
+    const existing = records[index];
+    const record = {
+      ...existing,
+      status: "Eliminada",
+      deletedAt: now,
+      deletedBy: String(currentUser.usuario || "").trim(),
+      deletedByName: String(currentUser.nombre || "").trim(),
+      updatedAt: now,
+      updatedBy: String(currentUser.usuario || "").trim(),
+      updatedByName: String(currentUser.nombre || "").trim()
+    };
+    await writeCommercialDevelopmentRecords(records.map(item => normalizeId(item?.id) === id ? record : item));
+    return record;
+  },
+
+  async listLegendConcepts() {
+    const records = await readCachedSharedJson("legend_concepts_v1", []);
+    return Array.isArray(records) ? records : [];
+  },
+
+  async listInternalChatMessages() {
+    const records = await readCachedSharedJson("internal_chat_v1", []);
+    return Array.isArray(records) ? records : [];
+  },
+
+  async saveInternalChatMessage(payload = {}) {
+    const text = String(payload.text || "").trim();
+    if (!text) throw new Error("El mensaje del chat no puede estar vacio.");
+    const now = nowIso();
+    const records = await readCachedSharedJson("internal_chat_v1", []);
+    const record = {
+      id: String(payload.id || `chat_${generateNumericId()}`),
+      text: text.slice(0, 5000),
+      authorName: String(payload.authorName || "Usuario").trim(),
+      authorUser: String(payload.authorUser || "").trim(),
+      authorRole: String(payload.authorRole || "").trim(),
+      createdAt: String(payload.createdAt || now),
+      updatedAt: now
+    };
+    const nextRecords = [record, ...(Array.isArray(records) ? records : [])]
+      .sort((a, b) => new Date(b?.createdAt || 0) - new Date(a?.createdAt || 0))
+      .slice(0, 300);
+    await writeSharedRecord("internal_chat_v1", nextRecords);
+    invalidateFirebaseCache("internal_chat_v1");
+    return record;
+  },
+
+  async listCommunications(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    const canManage = canManageCommunications(currentUser);
+    const includeArchived = Boolean(payload.includeArchived && canManage);
+    const includeExpired = Boolean(payload.includeExpired && canManage);
+    const records = await readCommunications();
+    return sortCommunications(records
+      .filter(item => canUserViewCommunication(currentUser, item))
+      .filter(item => canManage ? true : normalizeText(item?.estado) === "publicado")
+      .filter(item => includeArchived ? true : normalizeText(item?.estado) !== "archivado")
+      .filter(item => includeExpired ? true : !isCommunicationExpired(item))
+      .map(item => enrichCommunicationForUser(item, currentUser)));
+  },
+
+  async saveCommunication(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin", "analista", "supervisor", "formador"], "No tienes permisos para administrar comunicados.");
+    const title = String(payload.titulo || "").trim();
+    const description = String(payload.descripcion || "").trim();
+    const audience = String(payload.publicoObjetivo || "").trim();
+    if (!title) throw new Error("El titulo del comunicado es obligatorio.");
+    if (!description) throw new Error("La descripcion del comunicado es obligatoria.");
+    if (!audience) throw new Error("Debes indicar el publico objetivo del comunicado.");
+
+    const records = await readCommunications();
+    const communicationId = Number(payload.id) || generateNumericId();
+    const index = records.findIndex(item => Number(item?.id) === communicationId);
+    const existing = index >= 0 ? records[index] : null;
+    const now = nowIso();
+    const record = {
+      id: communicationId,
+      titulo: title,
+      descripcion: description,
+      categoria: String(payload.categoria || existing?.categoria || "Informacion importante").trim(),
+      publicoObjetivo: audience,
+      etiquetas: Array.isArray(existing?.etiquetas) ? existing.etiquetas : [],
+      prioridad: String(payload.prioridad || existing?.prioridad || "Media").trim(),
+      estado: String(payload.estado || existing?.estado || "Publicado").trim(),
+      fijado: Boolean(payload.fijado),
+      enlaceAdjunto: String(payload.enlaceAdjunto || existing?.enlaceAdjunto || ""),
+      fechaPublicacion: normalizeDateOrNow(payload.fechaPublicacion || existing?.fechaPublicacion),
+      fechaVencimiento: String(payload.fechaVencimiento || existing?.fechaVencimiento || "").trim(),
+      creadoPor: existing?.creadoPor || String(currentUser.nombre || "").trim(),
+      creadorUsuario: existing?.creadorUsuario || String(currentUser.usuario || "").trim(),
+      rolCreador: existing?.rolCreador || ROLE_LABELS[getRole(currentUser)] || getRole(currentUser),
+      fechaCreacion: existing?.fechaCreacion || now,
+      fechaActualizacion: now,
+      clientId: String(payload.clientId || payload.platformId || existing?.clientId || existing?.platformId || "").trim(),
+      platformId: String(payload.platformId || payload.clientId || existing?.platformId || existing?.clientId || "").trim(),
+      clientName: String(payload.clientName || existing?.clientName || "").trim(),
+      platformName: String(payload.platformName || payload.clientName || existing?.platformName || existing?.clientName || "").trim(),
+      comentarios: Array.isArray(existing?.comentarios) ? existing.comentarios : [],
+      leidosPor: Array.isArray(existing?.leidosPor) ? existing.leidosPor : [],
+      historialEdicion: Array.isArray(existing?.historialEdicion) ? existing.historialEdicion : [],
+      files: Array.isArray(existing?.files) ? existing.files : []
+    };
+    record.historialEdicion.push({
+      id: generateNumericId(),
+      usuario: String(currentUser.usuario || "").trim(),
+      nombre: String(currentUser.nombre || "").trim(),
+      rol: ROLE_LABELS[getRole(currentUser)] || getRole(currentUser),
+      accion: existing ? "update" : "create",
+      fechaHora: now
+    });
+    if (index >= 0) records[index] = record;
+    else records.push(record);
+    await writeCommunications(records);
+    return enrichCommunicationForUser(record, currentUser);
+  },
+
+  async deleteCommunication(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin", "analista", "supervisor", "formador"], "No tienes permisos para eliminar comunicados.");
+    const communicationId = Number(payload.id);
+    if (!communicationId) throw new Error("El comunicado es obligatorio.");
+    const records = await readCommunications();
+    const index = records.findIndex(item => Number(item?.id) === communicationId);
+    if (index < 0) throw new Error("No se encontro el comunicado solicitado.");
+    records.splice(index, 1);
+    await writeCommunications(records);
+    return true;
+  },
+
+  async markCommunicationAsRead(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    const communicationId = Number(payload.id);
+    if (!communicationId) throw new Error("El comunicado es obligatorio.");
+    const records = await readCommunications();
+    const index = records.findIndex(item => Number(item?.id) === communicationId);
+    if (index < 0) throw new Error("No se encontro el comunicado solicitado.");
+    const record = records[index];
+    if (!canUserViewCommunication(currentUser, record)) throw new Error("No tienes permiso para leer este comunicado.");
+    if (!Array.isArray(record.leidosPor)) record.leidosPor = [];
+    const userId = normalizeText(currentUser.usuario);
+    if (!record.leidosPor.some(item => normalizeText(item?.usuario) === userId)) {
+      record.leidosPor.push({
+        usuario: String(currentUser.usuario || "").trim(),
+        nombre: String(currentUser.nombre || "").trim(),
+        rol: ROLE_LABELS[getRole(currentUser)] || getRole(currentUser),
+        fechaHora: nowIso()
+      });
+      record.fechaActualizacion = nowIso();
+      records[index] = record;
+      await writeCommunications(records);
+    }
+    return enrichCommunicationForUser(record, currentUser);
+  },
+
+  async addCommunicationComment(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    const communicationId = Number(payload.id);
+    const text = String(payload.comentario || "").trim();
+    if (!communicationId) throw new Error("El comunicado es obligatorio.");
+    if (!text) throw new Error("El comentario no puede estar vacio.");
+    const records = await readCommunications();
+    const index = records.findIndex(item => Number(item?.id) === communicationId);
+    if (index < 0) throw new Error("No se encontro el comunicado solicitado.");
+    const record = records[index];
+    if (!canUserViewCommunication(currentUser, record)) throw new Error("No tienes permiso para comentar este comunicado.");
+    if (!Array.isArray(record.comentarios)) record.comentarios = [];
+    record.comentarios.push({
+      id: generateNumericId(),
+      comentario: text,
+      usuario: String(currentUser.usuario || "").trim(),
+      nombre: String(currentUser.nombre || "").trim(),
+      rol: ROLE_LABELS[getRole(currentUser)] || getRole(currentUser),
+      fechaHora: nowIso(),
+      parentId: Number(payload.parentId) || "",
+      respuestas: []
+    });
+    record.fechaActualizacion = nowIso();
+    records[index] = record;
+    await writeCommunications(records);
+    return enrichCommunicationForUser(record, currentUser);
+  },
+
+  async deleteCommunicationComment(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    const communicationId = Number(payload.id);
+    const commentId = Number(payload.commentId);
+    if (!communicationId || !commentId) throw new Error("El comentario es obligatorio.");
+    const records = await readCommunications();
+    const index = records.findIndex(item => Number(item?.id) === communicationId);
+    if (index < 0) throw new Error("No se encontro el comunicado solicitado.");
+    const record = records[index];
+    if (!Array.isArray(record.comentarios)) record.comentarios = [];
+    const commentIndex = record.comentarios.findIndex(item => Number(item?.id) === commentId);
+    if (commentIndex < 0) throw new Error("No se encontro el comentario solicitado.");
+    const comment = record.comentarios[commentIndex];
+    const isOwner = normalizeText(comment?.usuario) === normalizeText(currentUser.usuario);
+    if (!(getRole(currentUser) === "admin" || isOwner)) throw new Error("No tienes permisos para eliminar este comentario.");
+    record.comentarios.splice(commentIndex, 1);
+    record.fechaActualizacion = nowIso();
+    records[index] = record;
+    await writeCommunications(records);
+    return enrichCommunicationForUser(record, currentUser);
+  },
+
+  async getCommunicationFilePreview(fileId) {
+    const file = await findCommunicationFileById(fileId);
+    return buildLocalDrivePreview(file);
+  },
+
+  async listFeedbackRecords() {
+    const records = await readFeedbackRecords();
+    const slaResult = applyAutomaticFeedbackSla(records);
+    if (slaResult.changed) await writeFeedbackRecords(slaResult.records);
+    return sortFeedbackRecords(slaResult.records);
+  },
+
+  async listFeedbackVolumeRecords() {
+    const [volumeRecords, operationalRecords] = await Promise.all([readFeedbackVolumeRecords(), readFeedbackRecords()]);
+    return sortFeedbackRecords(volumeRecords.map(record => hydrateLegacyFeedbackVolumeRecord(record, operationalRecords)));
+  },
+
+  async createFeedbackVolume(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin"], "Solo un administrador puede generar volumen de feedbacks.");
+    const monitorUser = String(payload.monitorUser || "").trim();
+    const quantity = Number(payload.quantity);
+    const feedbackDate = String(payload.feedbackDate || "").trim();
+    const month = String(payload.month || "").trim();
+    const clientId = normalizeClientId(payload.clientId || payload.platformId || currentUser.clientId || currentUser.platformId);
+    if (!monitorUser) throw new Error("Selecciona un Monitor o Analista.");
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 600) throw new Error("La cantidad debe ser un numero entero entre 1 y 600.");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(feedbackDate)) throw new Error("Selecciona una fecha valida.");
+    if (!/^\d{4}-\d{2}$/.test(month)) throw new Error("Selecciona un mes valido.");
+    if (!feedbackDate.startsWith(`${month}-`)) throw new Error("La fecha debe pertenecer al mes seleccionado.");
+
+    const users = await readCachedSharedJson("users_v1", []);
+    const monitor = (Array.isArray(users) ? users : []).find(user => normalizeText(user?.usuario) === normalizeText(monitorUser));
+    if (!monitor || getRole(monitor) !== "analista" || isInactiveUserRecord(monitor)) {
+      throw new Error("El usuario seleccionado debe ser un Monitor o Analista activo.");
+    }
+
+    const operationalRecords = (await readFeedbackRecords()).filter(record => isRecordVisibleForClient(record, clientId));
+    if (!operationalRecords.length) throw new Error("No existen feedbacks operativos para usar como base en esta plataforma.");
+    const existingVolume = await readFeedbackVolumeRecords();
+    const now = nowIso();
+    const batchId = `volume_${Date.now()}`;
+    const generated = buildFeedbackVolumeRecords({operationalRecords,existingRecords:existingVolume,quantity,monitor,monitorUser,feedbackDate,month,clientId,clientName:payload.clientName,createdBy:currentUser.usuario,now,batchId});
+    await writeFeedbackVolumeRecords([...generated, ...existingVolume]);
+    return {ok:true,batchId,created:generated.length,records:generated};
+  },
+
+  async saveFeedbackRecord(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin", "analista", "formador", "supervisor", "coordinador"], "No tienes permisos para gestionar feedbacks.");
+
+    const assessor = String(payload.assessor || payload.asesorNombre || "").trim().toUpperCase();
+    if (!assessor) throw new Error("El asesor es obligatorio para registrar feedback.");
+
+    const tipoGestion = String(payload.tipoGestion || payload.feedbackCategory || "").trim();
+    const clasificacionFeedback = String(payload.clasificacionFeedback || "").trim();
+    const tipoRefuerzo = String(payload.tipoRefuerzo || "").trim();
+    if (!tipoGestion) throw new Error("El tipo de gestion es obligatorio.");
+    if (tipoGestion === "Feedback" && !clasificacionFeedback) throw new Error("La clasificacion del feedback es obligatoria.");
+    if (tipoGestion === "Refuerzo" && !tipoRefuerzo) throw new Error("El tipo de refuerzo es obligatorio.");
+    if (getRole(currentUser) === "formador" && tipoGestion !== "Refuerzo") throw new Error("El rol Formador solo puede crear registros de refuerzo.");
+
+    const scheduledMeetingAt = String(payload.scheduledMeetingAt || "").trim();
+    const notificationEmail = String(payload.notificationEmail || "").trim();
+    if ((scheduledMeetingAt && !notificationEmail) || (!scheduledMeetingAt && notificationEmail)) {
+      throw new Error("Para programar la cita online debes registrar fecha y hora junto con el correo de notificacion.");
+    }
+
+    const id = Number(payload.id) || generateNumericId();
+    const records = await readFeedbackRecords();
+    const existingIndex = records.findIndex(item => Number(item?.id) === id);
+    const existing = existingIndex >= 0 ? records[existingIndex] : null;
+    if (["supervisor", "coordinador"].includes(getRole(currentUser)) && (!existing || !isFeedbackOwner(existing, currentUser))) {
+      throw new Error("Solo puedes editar feedbacks generados desde tus propias evaluaciones.");
+    }
+    if (existing && String(existing.estado || existing.status || "") === "closed" && getRole(currentUser) !== "admin") {
+      throw new Error("Solo un administrador puede corregir un feedback cerrado.");
+    }
+    const now = nowIso();
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+    const record = {
+      ...(existing || {}),
+      ...sanitizeRuntimePayload(payload),
+      id,
+      asesorId: String(payload.asesorId || payload.advisorUser || assessor).trim(),
+      assessor,
+      asesorNombre: assessor,
+      auditorId: String(existing?.auditorId || payload.auditorId || currentUser.usuario || "").trim(),
+      auditorNombre: String(existing?.auditorNombre || payload.authorName || currentUser.nombre || "").trim(),
+      authorName: String(existing?.authorName || payload.authorName || currentUser.nombre || "").trim(),
+      authorUser: String(existing?.authorUser || payload.authorUser || currentUser.usuario || "").trim(),
+      authorRole: String(existing?.authorRole || payload.authorRole || ROLE_LABELS[getRole(currentUser)] || getRole(currentUser)).trim(),
+      advisorUser: String(payload.advisorUser || "").trim(),
+      supervisorName: String(payload.supervisorName || payload.supervisor || "").trim(),
+      supervisor: String(payload.supervisor || payload.supervisorName || "").trim(),
+      supervisorUser: String(payload.supervisorUser || "").trim(),
+      feedbackCategory: tipoGestion,
+      tipoGestion,
+      clasificacionFeedback,
+      tipoRefuerzo,
+      campaign: String(payload.campaign || "").trim(),
+      summary: tipoGestion,
+      feedbackText: String(payload.feedbackText || "").trim(),
+      observacionGeneral: String(payload.observacionGeneral || "").trim(),
+      compromisoMejora: String(payload.compromisoMejora || "").trim(),
+      resultadoGeneral: String(payload.resultadoGeneral || "").trim(),
+      feedbackDate: normalizeDateOrNow(payload.feedbackDate),
+      meetingType: String(payload.meetingType || "No especificado").trim(),
+      scheduledMeetingAt,
+      notificationEmail,
+      meetingLink: String(payload.meetingLink || "").trim(),
+      status: existing?.status || normalizeFeedbackStatusForSave(payload.advisorUser),
+      estado: existing?.estado || normalizeFeedbackStatusForSave(payload.advisorUser),
+      files: Array.isArray(payload.files) ? payload.files : (existing?.files || []),
+      messages: Array.isArray(existing?.messages) ? existing.messages : [],
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+      updatedBy: String(currentUser.usuario || "").trim(),
+      updatedByName: String(currentUser.nombre || "").trim()
+    };
+
+    if (existingIndex >= 0) records[existingIndex] = record;
+    else records.unshift(record);
+    await writeFeedbackRecords(records);
+
+    const storageResult = await uploadAttachmentsWithFirebaseFallback(
+      {
+        id: `feedback_${id}`,
+        idEvaluacion: `feedback_${id}`,
+        asesorNombre: assessor,
+        files: record.files
+      },
+      attachments
+    );
+    const savedFiles = [...record.files, ...(storageResult.savedFiles || [])];
+    const savedRecord = {
+      ...buildFileFieldsFromSavedFiles(record, savedFiles, storageResult),
+      estadoAdjuntos: attachments.length ? (storageResult.ok ? "completo" : "pendiente") : "sin_adjuntos",
+      updatedAt: nowIso()
+    };
+    const nextRecords = await readFeedbackRecords();
+    const index = nextRecords.findIndex(item => Number(item?.id) === id);
+    if (index >= 0) nextRecords[index] = savedRecord;
+    else nextRecords.unshift(savedRecord);
+    await writeFeedbackRecords(nextRecords);
+    return savedRecord;
+  },
+
+  async deleteFeedbackRecord(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin"], "Solo un administrador puede eliminar fichas de feedback.");
+    const id = Number(payload.id);
+    if (!id) throw new Error("El id del feedback es obligatorio.");
+    const records = await readFeedbackRecords();
+    const record = records.find(item => Number(item?.id) === id);
+    if (!record) throw new Error("No se encontro el feedback solicitado.");
+    await writeFeedbackRecords(records.filter(item => Number(item?.id) !== id));
+    return { ok: true, id };
+  },
+
+  async updateFeedbackRecord(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser || {
+      usuario: payload.actorUser || payload.acceptedByUser,
+      nombre: payload.actorName || payload.acceptedByName,
+      rol: payload.actorRole
+    });
+    const feedbackId = Number(payload.id);
+    if (!feedbackId) throw new Error("El id del feedback es obligatorio.");
+    const records = await readFeedbackRecords();
+    const index = records.findIndex(record => Number(record?.id) === feedbackId);
+    if (index < 0) throw new Error("No se encontro el feedback solicitado.");
+
+    let record = { ...records[index] };
+    const action = String(payload.action || "").trim();
+    const validActions = ["add_message", "submit_response", "accept_feedback", "reject_feedback", "submit_response_and_accept", "mark_viewed", "set_follow_up", "close_feedback", "mark_realized"];
+    if (!validActions.includes(action)) throw new Error("La accion de actualizacion no es valida.");
+
+    const actorName = String(payload.acceptedByName || payload.actorName || currentUser.nombre || "").trim();
+    const actorUser = String(payload.acceptedByUser || payload.actorUser || currentUser.usuario || "").trim();
+    const actorRole = String(payload.actorRole || ROLE_LABELS[getRole(currentUser)] || getRole(currentUser)).trim();
+    const actorIsAdvisor =
+      normalizeText(actorUser) === normalizeText(record.advisorUser) ||
+      getRole(currentUser) === "asesor";
+    const actorCanManageOwn = ["supervisor", "coordinador"].includes(getRole(currentUser)) && isFeedbackOwner(record, currentUser);
+
+    if ((!canManageFeedback(currentUser) || (["supervisor", "coordinador"].includes(getRole(currentUser)) && !actorCanManageOwn)) && !actorIsAdvisor) {
+      throw new Error("No tienes permisos para acceder a este feedback.");
+    }
+
+    const feedbackIsClosed = normalizeText(record.estado || record.status || "") === "closed";
+    const role = getRole(currentUser);
+    if (feedbackIsClosed && role !== "admin") {
+      throw new Error("Este feedback ya fue cerrado por supervisor. Solo un administrador puede modificarlo.");
+    }
+
+    if (action === "mark_realized") {
+      if (!record.automaticFromEvaluation) throw new Error("Solo los feedbacks automaticos admiten esta gestion.");
+      if (!["admin", "analista", "supervisor", "coordinador"].includes(role)) {
+        throw new Error("No tienes permisos para finalizar este feedback.");
+      }
+      if (role !== "admin" && !isFeedbackOwner(record, currentUser)) {
+        throw new Error("Solo el evaluador puede gestionar este feedback.");
+      }
+      record = completeAutomaticFeedback(record, currentUser);
+    }
+
+    if (action === "mark_viewed") {
+      if (!actorIsAdvisor) throw new Error("Solo el asesor puede marcar la lectura del feedback.");
+      record.fechaVisualizacionAsesor = record.fechaVisualizacionAsesor || nowIso();
+      if (record.estado === "pending") {
+        record.estado = "viewed";
+        record.status = "viewed";
+      }
+    }
+
+    if (action === "add_message" || action === "submit_response" || action === "submit_response_and_accept") {
+      const messageText = String(payload.messageText || payload.responseText || "").trim();
+      if (!messageText) throw new Error("El mensaje no puede estar vacio.");
+      appendFeedbackThreadMessage(record, { text: messageText, authorName: actorName, authorUser: actorUser, authorRole: actorRole });
+      if (actorIsAdvisor) {
+        record.comentarioAsesor = messageText;
+        record.fechaVisualizacionAsesor = record.fechaVisualizacionAsesor || nowIso();
+        if (record.estado === "pending") {
+          record.estado = "viewed";
+          record.status = "viewed";
+        }
+      }
+    }
+
+    if (action === "accept_feedback" || action === "reject_feedback" || action === "submit_response_and_accept") {
+      if (!actorIsAdvisor) throw new Error("Solo el asesor puede validar el feedback.");
+      if (record.automaticFromEvaluation && getAutomaticFeedbackFlowStatus(record) !== "pending_feedback") {
+        throw new Error("Este feedback ya no esta pendiente de aceptacion por el asesor.");
+      }
+      const responseText = String(payload.responseText || payload.messageText || "").trim();
+      if (!responseText) throw new Error("Para validar el feedback debes dejar un comentario.");
+      if (isFeedbackAdvisorValidated(record) && record.estado !== "viewed" && record.estado !== "pending" && record.estado !== "in_follow_up") {
+        throw new Error("Este feedback ya fue validado por el asesor.");
+      }
+      const decision = action === "reject_feedback" ? "rejected" : "accepted";
+      const decisionLabel = decision === "accepted" ? "Acepta feedback" : "No acepta feedback";
+      const alreadyAdded = (action === "submit_response_and_accept");
+      if (!alreadyAdded) {
+        appendFeedbackThreadMessage(record, {
+          text: `${decisionLabel}: ${responseText}`,
+          authorName: actorName,
+          authorUser: actorUser,
+          authorRole: actorRole
+        });
+      }
+      record.fechaVisualizacionAsesor = record.fechaVisualizacionAsesor || nowIso();
+      record.advisorValidationStatus = decision;
+      record.advisorDecision = decision;
+      record.advisorValidationComment = responseText;
+      record.advisorValidatedAt = nowIso();
+      record.advisorValidatedBy = actorUser;
+      record.advisorValidatedName = actorName;
+      record.advisorAcceptedAt = decision === "accepted" ? nowIso() : "";
+      record.advisorAcceptedBy = decision === "accepted" ? actorUser : "";
+      record.advisorAcceptedName = decision === "accepted" ? actorName : "";
+      record.comentarioAsesor = responseText;
+      record.estado = decision === "accepted" ? "advisor_accepted" : "advisor_rejected";
+      record.status = record.estado;
+      if (record.automaticFromEvaluation && decision === "accepted") {
+        record.managementStatus = "advisor_accepted";
+        record.compromisoMejora = responseText;
+      }
+    }
+
+    if (action === "set_follow_up") {
+      requireRoles(currentUser, ["admin", "analista"], "Solo administradores y analistas pueden reactivar el feedback en seguimiento.");
+      appendFeedbackThreadMessage(record, {
+        text: "El feedback fue reactivado en seguimiento. Se requiere una nueva validacion del asesor.",
+        authorName: actorName,
+        authorUser: actorUser,
+        authorRole: actorRole
+      });
+      record.advisorValidationStatus = "";
+      record.advisorDecision = "";
+      record.advisorValidationComment = "";
+      record.advisorValidatedAt = "";
+      record.advisorValidatedBy = "";
+      record.advisorValidatedName = "";
+      record.advisorAcceptedAt = "";
+      record.advisorAcceptedBy = "";
+      record.advisorAcceptedName = "";
+      record.comentarioAsesor = "";
+      record.fechaVisualizacionAsesor = "";
+      if (feedbackIsClosed && role === "admin") {
+        record.supervisorValidationComment = "";
+        record.supervisorValidatedAt = "";
+        record.supervisorValidatedBy = "";
+        record.supervisorValidatedName = "";
+      }
+      record.estado = "in_follow_up";
+      record.status = "in_follow_up";
+    }
+
+    if (action === "close_feedback") {
+      requireRoles(currentUser, ["supervisor"], "Solo el supervisor puede cerrar la validacion final del feedback.");
+      if (!isFeedbackAssignedToSupervisor(record, currentUser)) {
+        throw new Error("Este feedback esta asignado a otro supervisor.");
+      }
+      if (!isFeedbackAdvisorValidated(record)) {
+        throw new Error("El asesor debe validar primero el feedback antes del cierre del supervisor.");
+      }
+      const closingComment = String(payload.responseText || payload.messageText || "").trim();
+      if (!closingComment) throw new Error("Para cerrar el feedback debes dejar un comentario de validacion final.");
+      appendFeedbackThreadMessage(record, {
+        text: `Cierre supervisor: ${closingComment}`,
+        authorName: actorName,
+        authorUser: actorUser,
+        authorRole: actorRole
+      });
+      record.supervisorValidationComment = closingComment;
+      record.supervisorValidatedAt = nowIso();
+      record.supervisorValidatedBy = actorUser;
+      record.supervisorValidatedName = actorName;
+      record.estado = "closed";
+      record.status = "closed";
+    }
+
+    record.updatedAt = nowIso();
+    record.updatedBy = String(currentUser.usuario || "").trim();
+    records[index] = record;
+    await writeFeedbackRecords(records);
+    return record;
+  },
+
+  async getFeedbackFilePreview(fileId) {
+    const file = await findFeedbackFileById(fileId);
+    return buildLocalDrivePreview(file);
+  },
+
+  async listEvaluationRecords() {
+    return await readEvaluationRecordsFromFirebase();
+  },
+
+  async listEvaluationRecordsFast() {
+    return await readEvaluationRecordsFromFirebase();
+  },
+
+  async getEvaluationRecordDetail(id) {
+    const deletedIds = new Set((await readCachedSharedJson(DELETED_EVALUATIONS_KEY, []) || []).map(item => normalizeId(item?.id || item?.idEvaluacion || item)).filter(Boolean));
+    if (deletedIds.has(normalizeId(id))) return null;
+    const key = getEvaluationRecordKey(id);
+    const detail = await readCachedSharedJson(key, null);
+    if (detail) return await enrichEvaluationWithDirectDriveFolder(normalizeEvaluationRecordForRuntime(detail));
+    const records = await readEvaluationRecordsFromFirebase({ includeDetailFallback: false });
+    const record = records.find(item => normalizeId(item?.id || item?.idEvaluacion) === normalizeId(id)) || null;
+    return record ? await enrichEvaluationWithDirectDriveFolder(record) : null;
+  },
+
+  async saveEvaluationRecord(payload = {}) {
+    const evaluationId = normalizeId(payload.idEvaluacion || payload.id) || String(generateNumericId());
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin", "analista", "formador", "supervisor", "coordinador"], "No tienes permisos para guardar evaluaciones.");
+    const auditor = await resolveEvaluationAuditor(payload, currentUser);
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+    const evaluation = {
+      ...sanitizeRuntimePayload(payload),
+      id: evaluationId,
+      idEvaluacion: evaluationId,
+      fechaEvaluacion: normalizeDateOrNow(payload.fechaEvaluacion),
+      asesorNombre: String(payload.asesorNombre || "").trim().toUpperCase(),
+      auditorId: auditor.auditorId,
+      auditorNombre: auditor.auditorNombre,
+      estadoEvaluacion: String(payload.estadoEvaluacion || "open").trim(),
+      files: Array.isArray(payload.files) ? payload.files : [],
+      createdAt: payload.createdAt || nowIso(),
+      updatedAt: nowIso()
+    };
+
+    const savedBeforeAttachments = await persistEvaluation(evaluation);
+    const storageResult = await uploadAttachmentsWithFirebaseFallback(savedBeforeAttachments, attachments);
+    const savedFiles = [...(savedBeforeAttachments.files || []), ...(storageResult.savedFiles || [])];
+    const withAttachmentState = {
+      ...buildFileFieldsFromSavedFiles(savedBeforeAttachments, savedFiles, storageResult),
+      estadoAdjuntos: attachments.length ? (storageResult.ok ? "completo" : "pendiente") : "sin_adjuntos",
+      updatedAt: nowIso()
+    };
+    const savedEvaluation = await persistEvaluation(withAttachmentState);
+    const automaticFeedback = await ensureAutomaticFeedbackForEvaluation(savedEvaluation, currentUser);
+    return automaticFeedback
+      ? await persistEvaluation({...savedEvaluation, feedbackId: automaticFeedback.id})
+      : savedEvaluation;
+  },
+
+  async updateEvaluationRecord(payload = {}) {
+    const id = normalizeId(payload.idEvaluacion || payload.id);
+    if (!id) throw new Error("No se puede actualizar una evaluacion sin id.");
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin", "analista", "formador", "supervisor", "coordinador"], "No tienes permisos para actualizar evaluaciones.");
+    const current = await gasHandlers.getEvaluationRecordDetail(id);
+    if (!current) throw new Error(`No se encontro la evaluacion ${id}.`);
+    if (["supervisor", "coordinador"].includes(getRole(currentUser))) {
+      const currentOwner = normalizeText(current.auditorId || current.auditorUsuario);
+      if (!currentOwner || currentOwner !== normalizeText(currentUser.usuario)) {
+        throw new Error("Solo puedes editar evaluaciones registradas por tu usuario.");
+      }
+    }
+    const auditor = await resolveEvaluationAuditor(payload, currentUser, current);
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+    const updated = await persistEvaluation({
+      ...current,
+      ...sanitizeRuntimePayload(payload),
+      ...auditor,
+      id,
+      idEvaluacion: id,
+      updatedBy: String(currentUser.usuario || "").trim(),
+      updatedAt: nowIso()
+    });
+    if (!attachments.length) {
+      const automaticFeedback = await ensureAutomaticFeedbackForEvaluation(updated, currentUser);
+      return automaticFeedback ? await persistEvaluation({...updated, feedbackId: automaticFeedback.id}) : updated;
+    }
+    const storageResult = await uploadAttachmentsWithFirebaseFallback(updated, attachments);
+    const savedFiles = [...(updated.files || []), ...(storageResult.savedFiles || [])];
+    const savedWithAttachments = await persistEvaluation({
+      ...buildFileFieldsFromSavedFiles(updated, savedFiles, storageResult),
+      estadoAdjuntos: storageResult.ok ? "completo" : "pendiente",
+      updatedAt: nowIso()
+    });
+    const automaticFeedback = await ensureAutomaticFeedbackForEvaluation(savedWithAttachments, currentUser);
+    return automaticFeedback ? await persistEvaluation({...savedWithAttachments, feedbackId: automaticFeedback.id}) : savedWithAttachments;
+  },
+
+  async deleteEvaluationRecord(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin"], "Solo administradores pueden borrar evaluaciones.");
+    const id = normalizeId(payload.idEvaluacion || payload.id);
+    if (!id) throw new Error("No se puede borrar una evaluacion sin id.");
+    const deleted = await readCachedSharedJson(DELETED_EVALUATIONS_KEY, []);
+    const deletedList = Array.isArray(deleted) ? deleted : [];
+    const deletedExists = deletedList.some(item => normalizeId(item?.id || item?.idEvaluacion || item) === id);
+    const nextDeleted = deletedExists
+      ? deletedList
+      : [{ id, deletedAt: nowIso(), deletedBy: String(currentUser.usuario || "").trim() }, ...deletedList];
+    await deleteSharedRecord(getEvaluationRecordKey(id));
+    await withEvaluationIndexWriteLock(async () => {
+      const currentIndex = await readCachedSharedJson(EVALUATIONS_KEY, []);
+      const nextCompact = (Array.isArray(currentIndex) ? currentIndex : [])
+        .filter(item => normalizeId(item?.id || item?.idEvaluacion) !== id)
+        .map(buildEvaluationIndexRecord);
+      await writeSharedRecord(EVALUATIONS_KEY, nextCompact);
+      invalidateFirebaseCache(EVALUATIONS_KEY);
+    });
+    await writeSharedRecord(DELETED_EVALUATIONS_KEY, nextDeleted);
+    invalidateFirebaseCache(EVALUATIONS_KEY, DELETED_EVALUATIONS_KEY, getEvaluationRecordKey(id));
+    return { ok: true, id };
+  },
+
+  async uploadEvaluationAttachment(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin", "analista", "formador", "supervisor", "coordinador"], "No tienes permisos para subir adjuntos de evaluaciones.");
+    const id = normalizeId(payload.idEvaluacion || payload.id);
+    if (!id) throw new Error("El id de la evaluacion es obligatorio.");
+    return await withEvaluationWriteLock(id, async () => {
+      const current = await gasHandlers.getEvaluationRecordDetail(id);
+      if (!current) throw new Error("No se encontro la evaluacion principal en Firebase.");
+
+      const attachment = payload.attachment || null;
+      if (!attachment || typeof attachment !== "object") {
+        throw new Error("El adjunto de la evaluacion es obligatorio.");
+      }
+      const metadata = payload.attachmentMetadata && typeof payload.attachmentMetadata === "object" ? payload.attachmentMetadata : {};
+      const normalizedAttachment = {
+        ...attachment,
+        name: attachment.name || metadata.name || "adjunto_evaluacion",
+        mimeType: attachment.mimeType || metadata.mimeType || "application/octet-stream",
+        kind: attachment.kind || metadata.kind || metadata.type || "evaluation_attachment",
+        type: attachment.type || attachment.kind || metadata.kind || metadata.type || "evaluation_attachment",
+        size: attachment.size || metadata.size || 0
+      };
+
+      const storageResult = await uploadAttachmentsWithFirebaseFallback(current, [normalizedAttachment]);
+      const latest = await gasHandlers.getEvaluationRecordDetail(id) || current;
+      const savedFiles = mergeFilesByIdentity(
+        current.files,
+        latest.files,
+        storageResult.savedFiles
+      );
+      const next = {
+        ...buildFileFieldsFromSavedFiles(latest, savedFiles, storageResult),
+        estadoAdjuntos: storageResult.ok ? "completo" : "pendiente",
+        reintentoPendiente: !storageResult.ok,
+        ultimoErrorAdjuntos: storageResult.ok ? "" : (storageResult.storageWarning || "No se pudo guardar el adjunto."),
+        errorAdjuntos: storageResult.ok ? "" : (storageResult.storageWarning || "No se pudo guardar el adjunto."),
+        attachmentFailures: storageResult.ok ? [] : (storageResult.skippedAttachments || []),
+        updatedAt: nowIso(),
+        updatedBy: currentUser.usuario
+      };
+      return await persistEvaluation(next);
+    });
+  },
+
+  async markEvaluationAttachmentsPending(payload = {}) {
+    const currentUser = ensureCurrentUser(payload.currentUser);
+    requireRoles(currentUser, ["admin", "analista", "formador", "supervisor", "coordinador"], "No tienes permisos para actualizar adjuntos de evaluaciones.");
+    const id = normalizeId(payload.idEvaluacion || payload.id);
+    if (!id) throw new Error("El id de la evaluacion es obligatorio.");
+    const current = await gasHandlers.getEvaluationRecordDetail(id);
+    if (!current) throw new Error("No se encontro la evaluacion principal en Firebase.");
+    const message = String(payload.errorAdjuntos || payload.ultimoErrorAdjuntos || "Error de conexion al subir adjuntos.").trim();
+    return await persistEvaluation({
+      ...current,
+      estadoAdjuntos: String(payload.estadoAdjuntos || "error_red_drive").trim(),
+      reintentoPendiente: true,
+      ultimoErrorAdjuntos: message,
+      errorAdjuntos: message,
+      fechaErrorAdjuntos: nowIso(),
+      attachmentFailures: Array.isArray(payload.attachmentFailures) ? payload.attachmentFailures : [],
+      updatedAt: nowIso(),
+      updatedBy: currentUser.usuario
+    });
+  },
+
+  async validarConexiones() {
+    const keys = await listSharedKeys("");
+    return {
+      firebase: {
+        ok: true,
+        keysFound: keys.slice(0, 25),
+        evaluationRecordKeysFound: keys.filter(key => key.startsWith("evaluation_record_")).length
+      },
+      googleSheet: {
+        ok: false,
+        error: "Google Sheets queda como referencia de lectura; pendiente migrar lector Node."
+      },
+      drive: {
+        ...(await validateDriveConnection())
+      },
+      firebaseStorage: {
+        ...(await validateFirebaseStorageConnection())
+      }
+    };
+  }
+};

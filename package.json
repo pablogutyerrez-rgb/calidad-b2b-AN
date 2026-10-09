@@ -1,0 +1,24 @@
+{
+  "name": "calidad-b2b-vscode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server/index.js",
+    "start": "node server/index.js",
+    "test": "node --test",
+    "db:init": "node scripts/init-postgres.js",
+    "db:migrate": "node scripts/migrate-firebase-to-postgres.js",
+    "db:migrate:phase1": "node scripts/migrate-firebase-to-postgres.js --phase=1",
+    "db:status": "node scripts/migration-status.js",
+    "db:seed-admin": "node scripts/seed-postgres-admin.js"
+  },
+  "dependencies": {
+    "@google-cloud/storage": "^7.21.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "googleapis": "^144.0.0",
+    "pg": "^8.23.1"
+  }
+}
