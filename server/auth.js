@@ -47,9 +47,20 @@ export function protectUserWrites(incoming, existing) {
 function token(req) {
   return String(req.headers.cookie || "").split(";").map(item => item.trim()).find(item => item.startsWith(cookieName+"="))?.slice(cookieName.length+1);
 }
+export function isAllowedOrigin(req, env = process.env) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  const configured = env.PUBLIC_ORIGIN || (env.RAILWAY_PUBLIC_DOMAIN ? `https://${env.RAILWAY_PUBLIC_DOMAIN}` : "");
+  try {
+    const expected = new URL(configured || `${req.protocol}://${req.get("host")}`).origin;
+    return origin !== "null" && origin === expected;
+  } catch {
+    return false;
+  }
+}
 export function installAuth(app, jsonParser, onUsersChanged = () => {}) {
   app.use("/api", (req,res,next) => {
-    if (!["GET","HEAD"].includes(req.method) && req.headers.origin && req.headers.origin !== `${req.protocol}://${req.get("host")}`) return res.status(403).json({ok:false,error:"Origen no permitido."});
+    if (!["GET","HEAD"].includes(req.method) && !isAllowedOrigin(req)) return res.status(403).json({ok:false,error:"Origen no permitido."});
     next();
   });
   app.post("/api/auth/login", jsonParser, async(req,res,next) => {
@@ -72,7 +83,8 @@ export function installAuth(app, jsonParser, onUsersChanged = () => {}) {
       for (const [id,session] of sessions) if (session.expires < Date.now()) sessions.delete(id);
       const id = randomBytes(32).toString("hex");
       sessions.set(id,{usuario:user.usuario,expires:Date.now()+8*3600000});
-      res.cookie(cookieName,id,{httpOnly:true,sameSite:"strict",secure:req.secure,maxAge:8*3600000,path:"/"});
+      const secure = req.secure || Boolean(process.env.RAILWAY_PUBLIC_DOMAIN) || String(process.env.PUBLIC_ORIGIN || "").startsWith("https://");
+      res.cookie(cookieName,id,{httpOnly:true,sameSite:"strict",secure,maxAge:8*3600000,path:"/"});
       res.json({ok:true,user:publicData(user)});
     } catch(error) { next(error); }
   });

@@ -1,6 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { hashPassword, verifyPassword, publicData, protectUserWrites } from "../server/auth.js";
+import { hashPassword, verifyPassword, publicData, protectUserWrites, isAllowedOrigin } from "../server/auth.js";
+
+test("origin validation supports local and Railway HTTPS without trusting forwarded headers", () => {
+  const req = (origin, host = "localhost:5174") => ({protocol:"http", headers:{origin,"x-forwarded-host":"attacker.example","x-forwarded-proto":"https"},get:()=>host});
+  assert.equal(isAllowedOrigin(req("http://localhost:5174"), {}), true);
+  assert.equal(isAllowedOrigin(req("http://localhost:3001"), {}), false);
+  const railway = {RAILWAY_PUBLIC_DOMAIN:"quality.up.railway.app"};
+  assert.equal(isAllowedOrigin(req("https://quality.up.railway.app", "internal:8080"), railway), true);
+  assert.equal(isAllowedOrigin(req("https://attacker.example"), railway), false);
+  assert.equal(isAllowedOrigin(req("null"), railway), false);
+  assert.equal(isAllowedOrigin(req("http://quality.up.railway.app"), railway), false);
+  assert.equal(isAllowedOrigin(req("https://custom.example"), {...railway, PUBLIC_ORIGIN:"https://custom.example/"}), true);
+  assert.equal(isAllowedOrigin(req("https://quality.up.railway.app"), {...railway, PUBLIC_ORIGIN:"https://custom.example"}), false);
+  assert.equal(isAllowedOrigin(req("https://custom.example"), {PUBLIC_ORIGIN:"invalid"}), false);
+});
 
 test("passwords use salted hashes and reject incorrect credentials",()=>{
   const passwordHash = hashPassword("12345678");
