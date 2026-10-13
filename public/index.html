@@ -6321,33 +6321,17 @@ function App(){
   };
 
   const cambiarContrasenaActual = async(nuevaContrasena) => {
-    if (typeof google === "undefined") {
-      const response = await fetch("/api/auth/password",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:nuevaContrasena})});
-      const result = await response.json();
-      if (!response.ok) { notify("e",result.error); return false; }
-      setCurrentUser({...result.user,passwordChangeRequired:false,passwordChangeReason:""});
-      setUsers(await loadUsers());
-      return true;
-    }
-    if (!currentUser?.usuario) return false;
-    const normalizedUserKey = normalizeLoginKey(currentUser.usuario);
-    const nextPassword = String(nuevaContrasena || "").trim();
-    if (!normalizedUserKey || !nextPassword) return false;
-    const latestUsers = await loadUsers().catch(() => users);
-    const normalizedSource = normalizeUsersList(latestUsers && latestUsers.length ? latestUsers : users);
-    const now = new Date().toISOString();
-    const updated = normalizedSource.map(u => normalizeLoginKey(u.usuario) === normalizedUserKey && isRecordVisibleForPlatform(u, currentPlatformId)
-      ? {...u, password:nextPassword, mustChangePassword:false, passwordChangedAt:now, updatedAt:now}
-      : u
-    );
-    const saved = await saveUsers(updated);
-    if (saved === false) {
-      notify("e","No se pudo actualizar la contrasena.");
-      return false;
-    }
-    const updatedUser = updated.find(u => normalizeLoginKey(u.usuario) === normalizedUserKey && isRecordVisibleForPlatform(u, currentPlatformId));
-    setUsers(updated);
-    setCurrentUser({...currentUser,...updatedUser,passwordChangeRequired:false,passwordChangeReason:""});
+    if (!currentUser?.usuario) throw new Error("Inicia sesion para continuar.");
+    const response = await fetch("/api/auth/password",{
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({password:nuevaContrasena})
+    });
+    const result = await response.json();
+    if (!response.ok || result.ok !== true) throw new Error(result.error || "No se pudo actualizar la contrasena.");
+    if (!result.user?.usuario) throw new Error("Respuesta de usuario incompleta.");
+    setCurrentUser({...result.user,passwordChangeRequired:false,passwordChangeReason:""});
+    setUsers(previous => previous.map(item => normalizeLoginKey(item.usuario) === normalizeLoginKey(result.user.usuario) ? result.user : item));
     notify("s","Contrasena actualizada correctamente.");
     return true;
   };
@@ -8077,33 +8061,17 @@ function App(){
   };
 
   const cambiarContrasenaActual = async(nuevaContrasena) => {
-    if (!currentUser?.usuario) return false;
-    if (typeof google === "undefined") {
-      const response = await fetch("/api/auth/password",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:nuevaContrasena})});
-      const result = await response.json();
-      if (!response.ok) { notify("e",result.error); return false; }
-      setCurrentUser({...result.user,passwordChangeRequired:false,passwordChangeReason:""});
-      setUsers(await loadUsers());
-      return true;
-    }
-    const normalizedUserKey = normalizeLoginKey(currentUser.usuario);
-    const nextPassword = String(nuevaContrasena || "").trim();
-    if (!normalizedUserKey || !nextPassword) return false;
-    const latestUsers = await loadUsers().catch(() => users);
-    const normalizedSource = normalizeUsersList(latestUsers && latestUsers.length ? latestUsers : users);
-    const now = new Date().toISOString();
-    const updated = normalizedSource.map(u => normalizeLoginKey(u.usuario) === normalizedUserKey
-      ? {...u, password:nextPassword, mustChangePassword:false, passwordChangedAt:now, updatedAt:now}
-      : u
-    );
-    const saved = await saveUsers(updated);
-    if (saved === false) {
-      notify("e","No se pudo actualizar la contrasena.");
-      return false;
-    }
-    const updatedUser = mergeUserCandidatesForLogin(updated.filter(u => normalizeLoginKey(u.usuario) === normalizedUserKey));
-    setUsers(updated);
-    setCurrentUser({...currentUser,...updatedUser,passwordChangeRequired:false,passwordChangeReason:""});
+    if (!currentUser?.usuario) throw new Error("Inicia sesion para continuar.");
+    const response = await fetch("/api/auth/password",{
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({password:nuevaContrasena})
+    });
+    const result = await response.json();
+    if (!response.ok || result.ok !== true) throw new Error(result.error || "No se pudo actualizar la contrasena.");
+    if (!result.user?.usuario) throw new Error("Respuesta de usuario incompleta.");
+    setCurrentUser({...result.user,passwordChangeRequired:false,passwordChangeReason:""});
+    setUsers(previous => previous.map(item => normalizeLoginKey(item.usuario) === normalizeLoginKey(result.user.usuario) ? result.user : item));
     notify("s","Contrasena actualizada correctamente.");
     return true;
   };
