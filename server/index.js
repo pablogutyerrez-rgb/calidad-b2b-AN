@@ -10,6 +10,7 @@ import { listEvaluationFolderFiles, uploadEvaluationAttachmentsToDrive, validate
 import { getRealtimeDatabaseFileBlob, uploadBufferToRealtimeDatabase } from "./fileBlobs.js";
 import { gasHandlers, invalidateFirebaseCache } from "./gasHandlers.js";
 import { importStaffing } from "./staffingImport.js";
+import { updateUserAccess } from "./userAccess.js";
 import { validatePostgresConnection } from "./postgres.js";
 import { getFirebaseStorageFileStream, uploadBufferToFirebaseStorage, validateFirebaseStorageConnection } from "./storage.js";
 
@@ -66,6 +67,14 @@ app.post("/api/uploads/attachment", express.raw({ type: "application/octet-strea
 
 app.use(express.json({ limit: "80mb" }));
 app.use(express.urlencoded({ extended: true, limit: "80mb" }));
+
+app.patch("/api/users/:username/access",async(req,res,next)=>{
+  try {
+    const user=await updateUserAccess(req.authUser,req.params.username,req.body);
+    invalidateFirebaseCache("users_v1");
+    res.json({ok:true,user});
+  }catch(error){next(error);}
+});
 
 app.post("/api/staffing/import",async(req,res,next) => {
   if (req.authUser.rol !== "admin") return res.status(403).json({ok:false,error:"Solo el Administrador puede importar y crear usuarios."});

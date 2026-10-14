@@ -7954,78 +7954,34 @@ function App(){
     return true;
   };
 
-  const actualizarAccesoUsuario = async(usuario, platformAccess) => {
-    const normalizedUserKey = normalizeLoginKey(usuario);
-    const requestedAccess = Array.isArray(platformAccess) ? platformAccess : [];
-    const nextAccess = getAllPlatformIds().filter(platformId => requestedAccess.includes(platformId));
-    if (!normalizedUserKey || !nextAccess.length) {
-      notify("e","Selecciona al menos una plataforma para el usuario.");
-      return false;
-    }
-
-    const latestUsers = await loadUsers({preferBackend:true}).catch(() => users);
-    const normalizedSource = normalizeUsersList(latestUsers && latestUsers.length ? latestUsers : users);
-    const targetUser = normalizedSource.find(user => normalizeLoginKey(user.usuario) === normalizedUserKey);
-    if (!targetUser) {
-      notify("e","No se encontro el usuario para actualizar sus plataformas.");
-      return false;
-    }
-
-    const primaryPlatformId = nextAccess[0];
-    const updated = normalizeUsersList(normalizedSource.map(user => normalizeLoginKey(user.usuario) === normalizedUserKey
-      ? normalizeUserRecord({
-          ...user,
-          platformAccess: nextAccess,
-          clientId: primaryPlatformId,
-          platformId: primaryPlatformId,
-          clientName: getPlatformDisplayName(primaryPlatformId),
-          platformName: getPlatformDisplayName(primaryPlatformId),
-          updatedAt: new Date().toISOString()
-        })
-      : user
-    ));
-    const saved = await saveUsers(updated);
-    if (saved === false) {
-      notify("e","No se pudo guardar el acceso de plataformas.");
-      return false;
-    }
-
-    setUsers(updated);
-    if (currentUser?.usuario && normalizeLoginKey(currentUser.usuario) === normalizedUserKey) {
-      const refreshedUser = mergeUserCandidatesForLogin(updated.filter(user => normalizeLoginKey(user.usuario) === normalizedUserKey));
-      setCurrentUser(refreshedUser);
-      if (selectedPlatform?.id && !isUserAuthorizedForPlatform(refreshedUser, selectedPlatform.id)) {
-        setSelectedPlatform(null);
-        setView("legend");
+  const guardarAccesosUsuario = async(usuario, patch) => {
+    try {
+      const response = await fetch("/api/users/"+encodeURIComponent(usuario)+"/access", {
+        method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify(patch)
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok || !result.user) throw new Error(result.error || "No se pudieron guardar los accesos.");
+      const saved = normalizeUserRecord(result.user);
+      setUsers(previous => previous.map(user => normalizeLoginKey(user.usuario) === normalizeLoginKey(saved.usuario) ? saved : user));
+      localStorage.removeItem(USERS_CACHE_KEY);
+      if (normalizeLoginKey(currentUser?.usuario) === normalizeLoginKey(saved.usuario)) {
+        setCurrentUser(previous => ({...previous,...saved}));
+        if (selectedPlatform?.id && !isUserAuthorizedForPlatform(saved,selectedPlatform.id)) {
+          setSelectedPlatform(null);setView("legend");
+        }
       }
+      return true;
+    } catch(error) {
+      notify("e",error.message || "No se pudieron guardar los accesos.");
+      return false;
     }
-    notify("s","Accesos de plataforma actualizados.");
-    return true;
+  };
+  const actualizarAccesoUsuario = async(usuario, platformAccess) => {
+    return guardarAccesosUsuario(usuario,{platformAccess});
   };
 
   const actualizarAccesoDotacionUsuario = async(usuario, enabled) => {
-    const normalizedUserKey = normalizeLoginKey(usuario);
-    if (!normalizedUserKey) return false;
-    const latestUsers = await loadUsers({preferBackend:true}).catch(() => users);
-    const normalizedSource = normalizeUsersList(latestUsers && latestUsers.length ? latestUsers : users);
-    if (!normalizedSource.some(user => normalizeLoginKey(user.usuario) === normalizedUserKey)) {
-      notify("e","No se encontro el usuario para actualizar Dotacion.");
-      return false;
-    }
-    const updated = normalizeUsersList(normalizedSource.map(user => normalizeLoginKey(user.usuario) === normalizedUserKey
-      ? {...user,staffingAccess:Boolean(enabled),updatedAt:new Date().toISOString()}
-      : user
-    ));
-    const saved = await saveUsers(updated);
-    if (saved === false) {
-      notify("e","No se pudo guardar el acceso a Dotacion.");
-      return false;
-    }
-    setUsers(updated);
-    if (currentUser?.usuario && normalizeLoginKey(currentUser.usuario) === normalizedUserKey) {
-      setCurrentUser(prev => ({...prev,staffingAccess:Boolean(enabled)}));
-    }
-    return true;
+    return guardarAccesosUsuario(usuario,{staffingAccess:Boolean(enabled)});
   };
 
   const actualizarBloqueoFeedbacksUsuario = async(usuario, enabled) => {
