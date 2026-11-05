@@ -11,6 +11,7 @@ import { getRealtimeDatabaseFileBlob, uploadBufferToRealtimeDatabase } from "./f
 import { gasHandlers, invalidateFirebaseCache } from "./gasHandlers.js";
 import { importStaffing } from "./staffingImport.js";
 import { updateUserAccess } from "./userAccess.js";
+import { installSpeechRoutes } from "./speechAnalytics.js";
 import { validatePostgresConnection } from "./postgres.js";
 import { getFirebaseStorageFileStream, uploadBufferToFirebaseStorage, validateFirebaseStorageConnection } from "./storage.js";
 
@@ -67,6 +68,7 @@ app.post("/api/uploads/attachment", express.raw({ type: "application/octet-strea
 
 app.use(express.json({ limit: "80mb" }));
 app.use(express.urlencoded({ extended: true, limit: "80mb" }));
+installSpeechRoutes(app);
 
 app.patch("/api/users/:username/access",async(req,res,next)=>{
   try {
@@ -241,6 +243,9 @@ async function handleRpcRequest(req, res, next) {
     const args = req.body?.args || [];
     if (!Array.isArray(args)) return res.status(400).json({ok:false,error:"Argumentos invalidos."});
     const user = req.authUser;
+    if (["getData","saveData","deleteData"].includes(functionName) && String(args[0] || "").startsWith("speech_analytic_")) {
+      return res.status(403).json({ok:false,error:"Utiliza el modulo Speech analytic para consultar o importar estos datos."});
+    }
     if (["saveData","deleteData"].includes(functionName)) {
       const role = String(user.rol || "").toLowerCase();
       const key = args[0];

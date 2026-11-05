@@ -1,0 +1,44 @@
+import '../public/speech-model.js';
+import {randomUUID} from 'node:crypto';
+import {getPostgresPool,ensurePostgresSchema} from './postgres.js';
+import {getDatabaseBackend} from './database.js';
+
+const model=globalThis.SpeechModel;
+const dataKey='speech_analytic_entel_no_venta_v1';
+function fail(message,status=400){const e=new Error(message);e.status=status;throw e;}
+function authorize(user,write=false){if(!(write?model.canImport(user):model.canRead(user)))fail('No tienes acceso a Speech analytic de Entel.',403);if(getDatabaseBackend(dataKey)!=='postgres')fail('Speech analytic requiere PostgreSQL.',503);}
+function decode(row){if(!row)return {records:[],imports:[]};const value=JSON.parse(row.value);if(!Array.isArray(value.records)||!Array.isArray(value.imports))fail('Datos de Speech analytic invalidos.',500);return value;}
+export async function listSpeech(user){
+  authorize(user);await ensurePostgresSchema();
+  const result=await getPostgresPool().query('SELECT value FROM shared_records WHERE key=$1',[dataKey]);
+  return decode(result.rows[0]);
+}
+export async function importSpeech(user,payload){
+  authorize(user,true);
+  if(payload?.kind!=='no_venta')fail('La plantilla de Validacion de venta aun no esta configurada.');
+  const parsed=model.parseRows(payload.rows);
+  await ensurePostgresSchema();
+  const db=await getPostgresPool().connect();
+  try{
+    await db.query('BEGIN');await db.query('SELECT pg_advisory_xact_lock(782632)');
+    const current=decode((await db.query('SELECT value FROM shared_records WHERE key=$1 FOR UPDATE',[dataKey])).rows[0]);
+    const plan=model.planImport(parsed.rows,current.records);
+    const staffingRow=(await db.query('SELECT value FROM shared_records WHERE key=$1',['staffing'])).rows[0];
+    const staffing=staffingRow?JSON.parse(staffingRow.value):[];
+    const names=new Set(staffing.filter(s=>(s.clientId||s.platformId||'entel_b2b')==='entel_b2b').map(s=>model.norm(s.asesor)));
+    const unmatched=[...new Set(parsed.rows.filter(r=>!names.has(model.norm(r.advisor))).map(r=>r.advisor))];
+    const report={total:payload.rows.length,valid:parsed.rows.length,newCount:plan.added.length,duplicates:plan.duplicates.length,conflicts:plan.conflicts,errors:parsed.errors,unmatched,warnings:parsed.rows.flatMap(r=>r.warnings.map(message=>({row:r.row,message}))),sample:plan.added.slice(0,5)};
+    if(payload.commit!==true){await db.query('ROLLBACK');return {...report,committed:false};}
+    if(parsed.errors.length||plan.conflicts.length)fail('Corrige filas invalidas o conflictos antes de importar.');
+    if(unmatched.length&&!payload.allowUnmatched)fail('Confirma los asesores sin coincidencia en Dotacion.');
+    if(!plan.added.length){await db.query('ROLLBACK');return {...report,committed:true};}
+    const batch={id:randomUUID(),file:String(payload.file||'Importacion Excel').slice(0,250),createdAt:new Date().toISOString(),createdBy:user.usuario,count:plan.added.length,duplicates:plan.duplicates.length};
+    const next={records:[...current.records,...plan.added.map(r=>({...r,importId:batch.id,importedAt:batch.createdAt,importedBy:user.usuario,clientId:'entel_b2b'}))],imports:[batch,...current.imports]};
+    await db.query('INSERT INTO shared_records(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()',[dataKey,JSON.stringify(next)]);
+    await db.query('COMMIT');return {...report,committed:true};
+  }catch(e){await db.query('ROLLBACK');throw e;}finally{db.release();}
+}
+export function installSpeechRoutes(app){
+  app.get('/api/speech-analytics',async(req,res,next)=>{try{res.json({ok:true,...await listSpeech(req.authUser)});}catch(e){next(e);}});
+  app.post('/api/speech-analytics/import',async(req,res,next)=>{try{res.json({ok:true,...await importSpeech(req.authUser,req.body)});}catch(e){next(e);}});
+}

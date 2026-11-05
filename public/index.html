@@ -83,6 +83,9 @@ button:hover { filter: brightness(1.04); }
 <script src="/gas-bridge.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<link rel="stylesheet" href="/speech-analytics.css?v=1">
+<script src="/speech-model.js?v=1"></script>
+<script src="/speech-analytics.js?v=1"></script>
 <script>
 (function(){
 const {useState,useMemo,useRef,useEffect,createElement:h,Fragment}=React;
@@ -8636,6 +8639,7 @@ function App(){
           canViewCommercialDevelopmentModule(currentUser,currentPlatformId) && h("button",{style:{...BTN(view==="commercialDevelopment"?"p":"out"),width:"100%",justifyContent:"flex-start",padding:"16px 20px",color:view==="commercialDevelopment"?"#fff":"#8b92a5"},onClick:()=>setView("commercialDevelopment")},I("trend",18,view==="commercialDevelopment"?"#fff":"#8b92a5"),"HISTORIAL"),
           !isCommercialDevelopmentActive && canViewCalibrationModule(currentUser) && h("button",{style:{...BTN(view==="calibration"?"p":"out"),width:"100%",justifyContent:"flex-start",padding:"16px 20px",color:view==="calibration"?"#fff":"#8b92a5"},onClick:()=>setView("calibration")},I("sliders",18,view==="calibration"?"#fff":"#8b92a5"),"CALIBRACION DE CALIDAD"),
           canViewQualityVariableModule(currentUser,currentPlatformId) && h("button",{style:{...BTN(view==="qualityVariable"?"p":"out"),width:"100%",justifyContent:"flex-start",padding:"16px 20px",color:view==="qualityVariable"?"#fff":"#8b92a5"},onClick:()=>setView("qualityVariable")},I("trend",18,view==="qualityVariable"?"#fff":"#8b92a5"),"VARIABLE DE CALIDAD"),
+          currentPlatformId === DEFAULT_PLATFORM_ID && SpeechModel.canRead(currentUser) && h("button",{style:{...BTN(view==="speechAnalytics"?"p":"out"),width:"100%",justifyContent:"flex-start",padding:"16px 20px",color:view==="speechAnalytics"?"#fff":"#8b92a5"},onClick:()=>setView("speechAnalytics")},I("bar",18,view==="speechAnalytics"?"#fff":"#8b92a5"),"SPEECH ANALYTIC"),
           h("button",{style:{...BTN(view==="communications"?"p":"out"),width:"100%",justifyContent:"space-between",padding:"16px 20px",color:view==="communications"?"#fff":"#8b92a5"},onClick:()=>setView("communications")},
             h("span",{style:{display:"inline-flex",alignItems:"center",gap:12}},I("file",18,view==="communications"?"#fff":"#8b92a5"),"COMUNICADOS"),
             unreadCommunications>0 && h("span",{style:{minWidth:22,height:22,borderRadius:999,background:THEME.primary,color:"#fff",fontSize:10,fontWeight:800,display:"inline-flex",alignItems:"center",justifyContent:"center",padding:"0 6px"}},unreadCommunications)
@@ -8671,7 +8675,8 @@ function App(){
             ? h("div",{style:{...CARD,textAlign:"center",padding:36,color:"#9fb0d8"}},h("div",{style:{fontSize:16,fontWeight:800,color:"#fff",marginBottom:8}},"Cargando historial..."),"Estamos recuperando la informacion registrada de Desarrollo Comercial.")
             : h(CommercialDevelopmentCenterV2,{records:scopedCommercialDevelopmentRecords,currentUser,staffing:commercialDevelopmentAdvisorStaffing,users:scopedUsers,onSave:guardarDesarrolloComercial,onDelete:eliminarDesarrolloComercial,clientName:currentPlatformName})),
           !isCommercialDevelopmentActive && view==="calibration" && canViewCalibrationModule(currentUser) && h(CalibrationModule,{currentUser,users:scopedUsers,notify,clientId:currentPlatformId,clientName:currentPlatformName}),
-          view==="qualityVariable" && canViewQualityVariableModule(currentUser,currentPlatformId) && h(QualityVariableModule,{currentUser,notify,clientId:currentPlatformId})
+          view==="qualityVariable" && canViewQualityVariableModule(currentUser,currentPlatformId) && h(QualityVariableModule,{currentUser,notify,clientId:currentPlatformId}),
+          view==="speechAnalytics" && currentPlatformId === DEFAULT_PLATFORM_ID && SpeechModel.canRead(currentUser) && h(window.SpeechAnalytics,{currentUser})
         )
       )
     ),
@@ -13515,7 +13520,6 @@ function ContinuousImprovementDashboard({currentUser,feedbackRecords,evaluationR
     h("div",{style:{marginBottom:34}},
       h("div",{style:{fontSize:11,color:THEME.primary,textTransform:"uppercase",letterSpacing:"0.28em",fontWeight:800,marginBottom:12,fontFamily:THEME.displayFont}},"QUALITY SCOREBOARD"),
       h("h1",{style:{fontSize:44,fontWeight:700,color:THEME.text,letterSpacing:"0.03em",lineHeight:1.05,fontFamily:THEME.displayFont,textTransform:"uppercase",marginBottom:10}},"Dashboard operativo calidad Entel"),
-      evaluationRecords.some(record=>record.isDemo) && h("div",{role:"note",style:{color:THEME.accent,fontSize:12,marginBottom:12}},"Datos de demostracion: incluye evaluaciones y feedbacks simulados para presentacion comercial."),
       h("div",{style:{fontSize:13,color:"#9aa4ba",maxWidth:900,lineHeight:1.7}},"El foco principal de esta vista es el seguimiento de evaluaciones ponderadas por asesor y por equipo. Desde aqui puedes registrar evaluaciones directas y medir si el acompanamiento esta generando recuperacion real.")
     ),
     h("div",{style:{...CARD,marginBottom:24,padding:20}},
