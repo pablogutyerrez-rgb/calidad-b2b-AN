@@ -404,6 +404,7 @@ export function buildEvaluationIndexRecord(record = {}) {
   }));
   return {
     ...(record.isDemo ? {isDemo:true,demoBatch:record.demoBatch} : {}),
+    ...(record.source === 'speech_analytic' ? {source:record.source,saImportId:record.saImportId,saImportedAt:record.saImportedAt,saSourceFile:record.saSourceFile,saSourceId:record.saSourceId,saSourceVersion:record.saSourceVersion,saOriginalScore:record.saOriginalScore,pendingAdvisorCreation:record.pendingAdvisorCreation,saPendingCriteria:record.saPendingCriteria,advisorUser:record.advisorUser} : {}),
     id: normalizeId(record.id || record.idEvaluacion),
     idEvaluacion: normalizeId(record.idEvaluacion || record.id),
     feedbackId: record.feedbackId || "",
@@ -441,6 +442,12 @@ export function buildEvaluationIndexRecord(record = {}) {
 function withEvaluationIndexWriteLock(task) {
   const run = evaluationIndexWriteQueue.then(task, task);
   evaluationIndexWriteQueue = run.catch(() => {});
+  return run;
+}
+
+export function withSpeechEvaluationWriteLock(task) {
+  const run = automaticFeedbackWriteQueue.then(() => withEvaluationIndexWriteLock(task), () => withEvaluationIndexWriteLock(task));
+  automaticFeedbackWriteQueue = run.catch(() => {});
   return run;
 }
 
@@ -1143,6 +1150,7 @@ async function persistEvaluation(record) {
     (Array.isArray(record?.zeroToleranceItems) && record.zeroToleranceItems.some(item => normalizeText(item?.resultado) === "cumple"));
   const normalized = {
     ...record,
+    ...(record.source === 'speech_analytic' ? {saPendingCriteria:scoredSections.filter(s=>s.pesoSub>0&&!String(s.resultado||'').trim()).map(s=>s.nombreSeccion)} : {}),
     id,
     idEvaluacion: id,
     clientId,
@@ -3422,7 +3430,9 @@ export const gasHandlers = {
     const actorName = String(payload.acceptedByName || payload.actorName || currentUser.nombre || "").trim();
     const actorUser = String(payload.acceptedByUser || payload.actorUser || currentUser.usuario || "").trim();
     const actorRole = String(payload.actorRole || ROLE_LABELS[getRole(currentUser)] || getRole(currentUser)).trim();
-    const actorIsAdvisor =
+    const actorIsAdvisor = record.source === 'speech_analytic'
+      ? !record.pendingAdvisorCreation && getRole(currentUser) === 'asesor' && Boolean(record.advisorUser) && normalizeText(currentUser.usuario) === normalizeText(record.advisorUser)
+      :
       normalizeText(actorUser) === normalizeText(record.advisorUser) ||
       getRole(currentUser) === "asesor";
     const actorCanManageOwn = ["supervisor", "coordinador"].includes(getRole(currentUser)) && isFeedbackOwner(record, currentUser);

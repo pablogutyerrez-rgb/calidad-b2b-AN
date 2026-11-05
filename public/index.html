@@ -2430,6 +2430,7 @@ const BTN = t => {
 
 const sv = (paths, sz, col) => h("svg", {width:sz,height:sz,viewBox:"0 0 24 24",fill:"none",stroke:col,strokeWidth:2,strokeLinecap:"round",strokeLinejoin:"round"}, paths.map((p, i) => h("path", {key:i, d:p})));
 const IC = {
+  folder:["M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"],
   bar:["M12 20V10","M18 20V4","M6 20v-4"],
   file:["M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z","M14 2v6h6","M16 13H8","M16 17H8","M10 9H8"],
   up:["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4","M17 8l-5-5-5 5","M12 3v12"],
@@ -5888,7 +5889,7 @@ function FeedbackCenter({feedbackRecords,statisticalRecords,evaluationRecords,on
               const elapsedMs = createdMs && managedMs ? Math.max(0, managedMs-createdMs) : (createdMs ? Math.max(0,Date.now()-createdMs) : 0);
               const slaLabel = createdMs ? `${Math.floor(elapsedMs/3600000)}h ${Math.floor((elapsedMs%3600000)/60000)}m` : "-";
               return h("tr",{key:record.id,style:{borderBottom:"1px solid rgba(255,255,255,0.03)"}},
-                h("td",{style:{padding:"14px 16px",fontSize:12,color:"#fff",fontWeight:700}},record.asesorNombre || record.assessor),
+                h("td",{style:{padding:"14px 16px",fontSize:12,color:"#fff",fontWeight:700}},record.asesorNombre || record.assessor,record.source==="speech_analytic"&&h("small",{style:{display:"block",color:THEME.accent}},"SA",record.pendingAdvisorCreation?" · Usuario pendiente de creacion":"")),
                 h("td",{style:{padding:"14px 16px",fontSize:12,color:"#cbd5e1"}},record.auditorNombre || record.authorName || "-"),
                 h("td",{style:{padding:"14px 16px",fontSize:12,color:getFeedbackCategoryTheme(management).color,fontWeight:700}},management),
                 h("td",{style:{padding:"14px 16px",fontSize:12,color:"#cbd5e1"}},classification),
@@ -5923,12 +5924,14 @@ function AdvisorPortal({currentUser,users,staffing,feedbackRecords,evaluationRec
   const advisorName = profile?.advisorName || normalizeName(currentUser?.assessorName || currentUser?.nombre);
   const myFeedback = useMemo(() => (
     (feedbackRecords || [])
+      .filter(record => record.source!=="speech_analytic" || (!record.pendingAdvisorCreation && normalizeLoginKey(record.advisorUser)===normalizeLoginKey(currentUser.usuario)))
       .filter(record => String(record?.advisorUser || "").trim().toLowerCase() === String(currentUser?.usuario || "").trim().toLowerCase() || normalizeName(record?.asesorNombre || record?.assessor) === advisorName)
       .sort((a,b)=>getDateMs(b.feedbackDate || b.createdAt) - getDateMs(a.feedbackDate || a.createdAt))
   ), [feedbackRecords,currentUser,advisorName]);
   const myFeedbackIds = useMemo(() => new Set(myFeedback.map(record => String(record?.id || ""))), [myFeedback]);
   const myEvaluations = useMemo(() => (
     (evaluationRecords || [])
+      .filter(record => record.source!=="speech_analytic" || (!record.pendingAdvisorCreation && normalizeLoginKey(record.advisorUser)===normalizeLoginKey(currentUser.usuario)))
       .filter(evaluation =>
         String(evaluation?.advisorUser || "").trim().toLowerCase() === String(currentUser?.usuario || "").trim().toLowerCase() ||
         String(evaluation?.asesorId || "").trim().toLowerCase() === String(currentUser?.usuario || "").trim().toLowerCase() ||
@@ -8676,7 +8679,7 @@ function App(){
             : h(CommercialDevelopmentCenterV2,{records:scopedCommercialDevelopmentRecords,currentUser,staffing:commercialDevelopmentAdvisorStaffing,users:scopedUsers,onSave:guardarDesarrolloComercial,onDelete:eliminarDesarrolloComercial,clientName:currentPlatformName})),
           !isCommercialDevelopmentActive && view==="calibration" && canViewCalibrationModule(currentUser) && h(CalibrationModule,{currentUser,users:scopedUsers,notify,clientId:currentPlatformId,clientName:currentPlatformName}),
           view==="qualityVariable" && canViewQualityVariableModule(currentUser,currentPlatformId) && h(QualityVariableModule,{currentUser,notify,clientId:currentPlatformId}),
-          view==="speechAnalytics" && currentPlatformId === DEFAULT_PLATFORM_ID && SpeechModel.canRead(currentUser) && h(window.SpeechAnalytics,{currentUser})
+          view==="speechAnalytics" && currentPlatformId === DEFAULT_PLATFORM_ID && SpeechModel.canRead(currentUser) && h(window.SpeechAnalytics,{currentUser,onImported:async()=>{await reloadEvaluationRecords();await reloadFeedbackRecords();}})
         )
       )
     ),
@@ -8941,6 +8944,7 @@ function getVisibleEvaluationRecords(currentUser, staffing, evaluationRecords){
 }
 
 function EvaluationsCenter({currentUser,evaluationRecords,staffing,users,onOpenEvaluation,onDeleteEvaluation,platformId}){
+  const [saFolder,setSaFolder] = useState("");
   const [search,setSearch] = useState("");
   const [modeFilter,setModeFilter] = useState(() => String(currentUser?.rol || "").trim().toLowerCase() === "formador" ? "ojt" : "all");
   const [monitorFilter,setMonitorFilter] = useState("all");
@@ -8973,6 +8977,8 @@ function EvaluationsCenter({currentUser,evaluationRecords,staffing,users,onOpenE
   );
 
   const openDetail = row => onOpenEvaluation(buildEvaluationEntryContext(row), row);
+  const saFolders = [...new Map(rows.filter(row=>row.source==="speech_analytic"&&row.saImportId).map(row=>[row.saImportId,{id:row.saImportId,date:row.saImportedAt}])).values()].sort((a,b)=>String(b.date).localeCompare(String(a.date)));
+  const displayedRows = saFolder ? rows.filter(row=>row.saImportId===saFolder) : rows.filter(row=>!row.saImportId);
   const canDeleteEvaluations = String(currentUser?.rol || "").trim().toLowerCase() === "admin";
   const activeAdvisorProfiles = useMemo(() => (staffing || [])
     .filter(Boolean)
@@ -9027,16 +9033,21 @@ function EvaluationsCenter({currentUser,evaluationRecords,staffing,users,onOpenE
       h(ImprovementKpiCard,{label:"Abiertas",value:String(rows.filter(item=>item?.estadoEvaluacion!=="closed").length),caption:"Guardadas o en proceso",color:THEME.accent}),
       h(ImprovementKpiCard,{label:"Evaluaciones OJT",value:String(rows.filter(isOjtEvaluationRecord).length),caption:"Personal nuevo / entrenamiento",color:THEME.violet})
     ),
+    (saFolders.length>0 || saFolder) && h("div",{style:{...CARD,marginBottom:20}},
+      h("div",{style:{fontWeight:800,marginBottom:12}},"Cargas Speech analytic"),
+      h("div",{style:{display:"flex",gap:10,flexWrap:"wrap"}},saFolders.map(folder=>h("button",{key:folder.id,style:BTN(saFolder===folder.id?"p":"out"),onClick:()=>setSaFolder(folder.id)},I("folder",16,"currentColor"),new Date(folder.date).toLocaleString("es-PE",{timeZone:"America/Lima"})," · SA · ",rows.filter(row=>row.saImportId===folder.id).length))),
+      saFolder && h("button",{style:{...BTN("out"),marginTop:12},onClick:()=>setSaFolder("")},"VOLVER A EVALUACIONES")
+    ),
     h("div",{style:{...CARD,marginBottom:0}},
       h("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,marginBottom:16,flexWrap:"wrap"}},
-        h("div",{style:{fontSize:12,fontWeight:800,color:"#fff",textTransform:"uppercase",letterSpacing:"0.14em",fontFamily:THEME.displayFont}},"Todas las evaluaciones ingresadas"),
-        h("div",{style:{fontSize:11,color:"#8b92a5"}},rows.length," registros")
+        h("div",{style:{fontSize:12,fontWeight:800,color:"#fff",textTransform:"uppercase",letterSpacing:"0.14em",fontFamily:THEME.displayFont}},saFolder ? "Evaluaciones SA de la carga" : "Evaluaciones ingresadas"),
+        h("div",{style:{fontSize:11,color:"#8b92a5"}},displayedRows.length," registros")
       ),
       h(SimpleDataTable,{
         columns:[
           {key:"fechaEvaluacion",label:"Fecha",render:row=>formatFeedbackDate(row.fechaEvaluacion || row.createdAt)},
-          {key:"evaluationMode",label:"Modalidad",render:row=>isOjtEvaluationRecord(row) ? "OJT" : "Operacion"},
-          {key:"asesorNombre",label:"Asesor",bold:true},
+          {key:"evaluationMode",label:"Modalidad",render:row=>row.source==="speech_analytic" ? "SA" : isOjtEvaluationRecord(row) ? "OJT" : "Operacion"},
+          {key:"asesorNombre",label:"Asesor",bold:true,render:row=>h("div",null,row.asesorNombre,row.pendingAdvisorCreation&&h("div",{style:{color:THEME.accent,fontSize:11}},"Usuario pendiente de creacion"),row.saPendingCriteria?.length>0&&h("div",{style:{color:"#ffca50",fontSize:11}},"PUE pendiente de revision"))},
           {key:"resultadoGeneral",label:"Nota",bold:true},
           {key:"estadoEvaluacion",label:"Estado",render:row=>h("span",{style:{background:row.estadoEvaluacion==="closed" ? "rgba(25,195,125,0.12)" : "rgba(29,43,255,0.12)",border:row.estadoEvaluacion==="closed" ? "1px solid rgba(25,195,125,0.28)" : "1px solid rgba(29,43,255,0.28)",color:row.estadoEvaluacion==="closed" ? "#19C37D" : THEME.primary,padding:"6px 10px",borderRadius:999,fontSize:10,fontWeight:800,letterSpacing:"0.1em",fontFamily:THEME.displayFont}},row.estadoEvaluacion==="closed" ? "CERRADA" : "GUARDADA")},
           {key:"auditorNombre",label:"Auditor"},
@@ -9046,7 +9057,7 @@ function EvaluationsCenter({currentUser,evaluationRecords,staffing,users,onOpenE
             canDeleteEvaluations && h("button",{style:{...BTN("out"),padding:"8px 12px",color:THEME.accent,border:"1px solid rgba(230,0,168,0.35)"},onClick:()=>onDeleteEvaluation(row)},I("trash",12,THEME.accent),"BORRAR")
           )}
         ],
-        rows,
+        rows:displayedRows,
         emptyMessage:"No hay evaluaciones registradas para tu perfil o filtros actuales."
       })
     ),
@@ -11263,7 +11274,7 @@ function EvaluationModal({isOpen,onClose,feedbackRecord,evaluationRecord,current
     const currentSections = storedSections.length
       ? normalizeEvaluationSectionsForScoring(storedSections, initialFormType || "venta", sourceClientId)
       : template.map(section => ({...section}));
-    const currentZeroTolerance = Array.isArray(sourceEvaluation?.zeroToleranceItems) && sourceEvaluation.zeroToleranceItems.length
+    const currentZeroTolerance = sourceEvaluation?.source === "speech_analytic" && Array.isArray(sourceEvaluation.zeroToleranceItems) ? sourceEvaluation.zeroToleranceItems.map(item=>({...item})) : Array.isArray(sourceEvaluation?.zeroToleranceItems) && sourceEvaluation.zeroToleranceItems.length
       ? zeroToleranceTemplate.map(item => {
           const existing = sourceEvaluation.zeroToleranceItems.find(entry => normalizeName(entry?.subItem) === normalizeName(item.subItem));
           return existing ? {...item,...existing} : {...item};
@@ -11736,6 +11747,8 @@ function EvaluationModal({isOpen,onClose,feedbackRecord,evaluationRecord,current
       h("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",gap:18,marginBottom:24}},
         h("div",null,
           h("div",{style:{fontSize:22,fontWeight:800,color:"#fff",marginBottom:6}},`Ficha de evaluacion de calidad - ${clientName}`),
+          currentEvaluation?.source === "speech_analytic" && h("div",{style:{color:THEME.accent,fontSize:12}},"SA · Speech analytic · ",currentEvaluation.saSourceFile,currentEvaluation.pendingAdvisorCreation ? " · Usuario pendiente de creacion" : ""),
+          currentEvaluation?.source === "speech_analytic" && currentEvaluation.saPendingCriteria?.length>0 && h("div",{style:{color:"#ffca50",fontSize:12}},"Nota PUE provisional. Revisar: ",currentEvaluation.saPendingCriteria.join(", ")),
           h("div",{style:{fontSize:12,color:"#8b92a5"}},"Formato ponderado: Cumple suma el peso completo, No cumple vale 0 y No aplica no entra al promedio.")
         ),
         h("button",{style:{...BTN("out"),padding:"10px 14px"},onClick:onClose},"CERRAR")

@@ -25,7 +25,7 @@ function Detail({record,onClose}){
    h('p',{className:'sa-muted'},'Nota original del SA. Los minutos son referencias de evidencia; este Excel no incluye un audio reproducible.'),
    groups.map(([label,predicate])=>h('details',{key:label,open:label==='Ficha de calidad'},h('summary',null,label),h('div',{className:'sa-table-wrap'},h('table',null,h('thead',null,h('tr',null,['Criterio / campo','Resultado','Evidencia / explicacion','Minuto'].map(v=>h('th',{key:v},v)))),h('tbody',null,Object.keys(record.source).filter(k=>!metadata.includes(k)&&!k.includes(' — ')&&predicate(k)).map(k=>h('tr',{key:k},h('td',null,k),h('td',null,record.source[k]||'Sin dato'),h('td',{className:'sa-evidence'},record.source[k+' — por qu\u00e9']||'Sin evidencia escrita'),h('td',null,record.source[k+' — minuto']||'Sin minuto')))))))));
 }
-window.SpeechAnalytics=function SpeechAnalytics({currentUser}){
+window.SpeechAnalytics=function SpeechAnalytics({currentUser,onImported}){
  const [tab,setTab]=useState('no_venta'),[view,setView]=useState('summary'),[records,setRecords]=useState([]),[imports,setImports]=useState([]),[loading,setLoading]=useState(true),[error,setError]=useState('');
  const [filters,setFilters]=useState({}),[page,setPage]=useState(0),[detail,setDetail]=useState(null),[preview,setPreview]=useState(null),[upload,setUpload]=useState(null),[busy,setBusy]=useState(false),[allowUnmatched,setAllowUnmatched]=useState(false),[message,setMessage]=useState(''),[evidence,setEvidence]=useState(null);
  const load=async()=>{setLoading(true);try{const data=await request('/api/speech-analytics');setRecords(data.records);setImports(data.imports);}catch(e){setError(e.message);}finally{setLoading(false);}};
@@ -53,7 +53,7 @@ window.SpeechAnalytics=function SpeechAnalytics({currentUser}){
  }
  async function confirmImport(){
   setBusy(true);setError('');
-  try{const result=await request('/api/speech-analytics/import',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...upload,commit:true,allowUnmatched})});setPreview(null);setUpload(null);setMessage(`${result.newCount} analisis importados. ${result.duplicates} duplicados omitidos.`);await load();}
+  try{const result=await request('/api/speech-analytics/import',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...upload,commit:true,allowUnmatched})});setPreview(null);setUpload(null);setMessage(`${result.newCount} analisis importados. ${result.evaluationCount} evaluaciones SA y ${result.feedbackCount} feedbacks creados. ${result.duplicates} duplicados omitidos.`);await load();if(onImported)await onImported();}
   catch(e){setError(e.message);}finally{setBusy(false);}
  }
  const select=(key,label)=>h('label',{key},label,h('select',{value:filters[key]||'',onChange:e=>setFilter(key,e.target.value)},h('option',{value:''},'Todos'),[...new Set(records.map(r=>r[key]).filter(Boolean))].sort().map(v=>h('option',{key:v,value:v},text(v)))));
@@ -69,7 +69,7 @@ window.SpeechAnalytics=function SpeechAnalytics({currentUser}){
    invalidDates&&h('p',{role:'alert',className:'sa-error'},'La fecha Desde no puede ser posterior a Hasta.'),
    loading?h('p',{role:'status'},'Cargando analisis...'):h(React.Fragment,null,
     h('div',{className:'sa-kpis'},[['Llamadas unicas',stats.n],['Asesores',stats.advisors.length],['Nota promedio SA',pct(stats.average)],['Alcanzan 90%',stats.passed+' / '+stats.n],['Cero tolerancia',stats.critical],['Recuperabilidad alta',stats.high]].map(([label,value])=>h('div',{key:label},h('small',null,label),h('strong',null,value)))),
-    h('p',{className:'sa-muted'},'Resultados originales del SA, separados del dashboard operativo. Sin filtro de version se usa la mas reciente por archivo. No aplica y Sin dato se excluyen del denominador de cumplimiento.'),
+    h('p',{className:'sa-muted'},'Resultados originales del SA. Las evaluaciones generadas alimentan el dashboard operativo con los pesos de la PUE; su nota puede diferir de la nota SA. Sin filtro de version se usa la mas reciente por archivo.'),
     h('nav',{className:'sa-tabs','aria-label':'Vista'},[['summary','Resultados globales'],['calls','Llamadas'],['opportunities','Oportunidades'],['imports','Importaciones']].map(([v,label])=>h('button',{key:v,className:view===v?'sa-primary':'',onClick:()=>setView(v)},label))),
     !rows.length&&view!=='imports'?h('div',{className:'sa-empty'},records.length?'No hay resultados con estos filtros.':'Aun no hay analisis importados.'):view==='summary'?h(React.Fragment,null,
      h('div',{className:'sa-chart-grid'},h(Bars,{title:'Incumplimiento por criterio',percentage:true,items:stats.criteria.filter(r=>r.applicable).map(r=>({label:r.label,value:r.rate,caption:`${r.no}/${r.applicable} (${pct(r.rate)})`}))}),
@@ -87,7 +87,10 @@ window.SpeechAnalytics=function SpeechAnalytics({currentUser}){
     [...preview.errors,...preview.conflicts.map(c=>({row:c.row,message:'El ID o archivo ya existe con datos distintos; no se sobrescribira.'})),...preview.warnings].map((e,i)=>h('p',{key:i,className:'sa-error'},`Fila ${e.row}: ${e.message}`)),
     h('div',{className:'sa-table-wrap'},h('table',null,h('thead',null,h('tr',null,['ID','Asesor','Fecha','Nota'].map(k=>h('th',{key:k},k)))),h('tbody',null,preview.sample.map(r=>h('tr',{key:M.key(r)},h('td',null,r.id),h('td',null,r.advisor),h('td',null,r.callDate),h('td',null,pct(r.score))))))),
     !!preview.unmatched.length&&h('div',null,h('p',null,'Sin coincidencia exacta en Dotacion: '+preview.unmatched.join(', ')),h('label',null,h('input',{type:'checkbox',checked:allowUnmatched,onChange:e=>setAllowUnmatched(e.target.checked)}),' Conservar nombres del SA sin crear usuarios ni modificar Dotacion')),
-    h('p',{className:'sa-muted'},'La importacion no crea evaluaciones, feedbacks, compromisos ni tareas.'),h('button',{className:'sa-primary',disabled:busy||!preview.newCount||!!preview.errors.length||!!preview.conflicts.length||(!!preview.unmatched.length&&!allowUnmatched),onClick:confirmImport},busy?'Guardando...':'Confirmar importacion')),
+    h('p',null,`${preview.evaluationCount} evaluaciones SA y ${preview.feedbackCount} feedbacks nuevos. Evaluador: ${currentUser.nombre||currentUser.usuario}. Se respetan los bloqueos de feedback.`),
+    !!preview.pendingCriteria?.length&&h('p',{className:'sa-error'},'PUE pendiente de revision (sin inventar cumplimiento): '+preview.pendingCriteria.join(', ')+'. Nota provisional sobre los criterios informados.'),
+    !!preview.unmatched.length&&h('p',{className:'sa-error'},'Usuario pendiente de creacion: se conserva el asesor informado y el feedback queda sin usuario vinculado.'),
+    h('button',{className:'sa-primary',disabled:busy||(!preview.newCount&&!preview.evaluationCount)||!!preview.errors.length||!!preview.conflicts.length||(!!preview.unmatched.length&&!allowUnmatched),onClick:confirmImport},busy?'Guardando...':'Confirmar importacion')),
   evidence&&h(Dialog,{title:'Evidencias: '+evidence,onClose:()=>setEvidence(null)},rows.filter(r=>M.norm(r.source[evidence])==='no').map(r=>h('article',{key:M.key(r)},h('h3',null,r.advisor+' · '+r.callDate),h('p',null,r.source[evidence+' — por qu\u00e9']||'Sin evidencia escrita'),h('p',null,'Minuto: '+(r.source[evidence+' — minuto']||'Sin dato')),h('button',{onClick:()=>{setEvidence(null);setDetail(r);}},'Ver analisis completo')))),
   detail&&h(Detail,{record:detail,onClose:()=>setDetail(null)}));
 };

@@ -11,13 +11,25 @@ const {installAuth,hashPassword}=await import('../server/auth.js');
 const {installSpeechRoutes}=await import('../server/speechAnalytics.js');
 const rows=JSON.parse(fs.readFileSync('reference/speech/source-rows.json','utf8').replace(/^\uFEFF/,''));
 await ensurePostgresSchema();const pool=getPostgresPool();
-await pool.query('CREATE TEMP TABLE shared_records(key text PRIMARY KEY,value text,updated_at timestamptz DEFAULT now())');
+await pool.query('CREATE TEMP TABLE shared_records(key text PRIMARY KEY,value text,updated_at timestamptz DEFAULT now(),migrated_from text,checksum text)');
 const password='test-speech-session-only';
 const users=[['admin','admin','entel_b2b'],['analyst','analista','entel_b2b'],['reader','supervisor','entel_b2b'],['other','admin','culqi_bcp']].map(([usuario,rol,platform])=>({usuario,rol,estado:'activo',platformAccess:[platform],passwordHash:hashPassword(password)}));
 await pool.query('INSERT INTO shared_records(key,value) VALUES($1,$2)',['users_v1',JSON.stringify(users)]);
 for(const key of ['evaluations_v1','feedback_records_v2','sales_validations_v1','staffing'])await pool.query('INSERT INTO shared_records(key,value) VALUES($1,$2)',[key,'[]']);
 const app=express();installAuth(app,express.json());app.use(express.json({limit:'20mb'}));installSpeechRoutes(app);app.use((e,req,res,next)=>res.status(e.status||500).json({ok:false,error:e.message}));
 app.use(express.static('public'));
+app.get('/test-generated',async(req,res)=>{
+ const result=await pool.query('SELECT key,value FROM shared_records');const values=new Map(result.rows.map(r=>[r.key,JSON.parse(r.value)]));
+ res.json({evaluationRecords:values.get('evaluations_v1'),feedbackRecords:values.get('feedback_records_v2'),details:result.rows.filter(r=>r.key.startsWith('evaluation_record_')).map(r=>JSON.parse(r.value)),staffing:[],users:[],historico:[],noTipificationRecords:[],currentUser:{usuario:'admin',rol:'admin',nombre:'Admin'}});
+});
+app.get('/test-evaluations',(req,res)=>res.send(fs.readFileSync('public/index.html','utf8').replace('ReactDOM.render(h(AppErrorBoundary,null,h(App)), document.getElementById("root"));',`
+ fetch('/test-generated').then(r=>r.json()).then(data=>{
+  window.testDataset=buildImprovementDataset(data);
+  function TestEvaluationView(){const [detail,setDetail]=useState(null);return h(Fragment,null,
+   h(EvaluationsCenter,{...data,platformId:'entel_b2b',onOpenEvaluation:(_,row)=>setDetail(data.details.find(d=>d.id===row.id)),onDeleteEvaluation:()=>{}}),
+   detail&&h(EvaluationModal,{isOpen:true,evaluationRecord:detail,feedbackRecord:{},currentUser:data.currentUser,users:[],onClose:()=>setDetail(null),notify:()=>{},platform:{id:'entel_b2b',name:'Entel Empresas B2B'}}));}
+  ReactDOM.render(h(TestEvaluationView),document.getElementById('root'));
+ });`)));
 app.get('/test-speech',(req,res)=>res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/speech-analytics.css"><style>body{margin:0;background:#08080d;font-family:Arial;padding:24px;box-sizing:border-box}*{box-sizing:border-box}</style></head><body><div id="root"></div><script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script><script src="/speech-model.js"></script><script src="/speech-analytics.js"></script><script>ReactDOM.render(React.createElement(SpeechAnalytics,{currentUser:{rol:'admin',platformAccess:['entel_b2b']}}),document.getElementById('root'))</script></body></html>`));
 const server=app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));const base='http://127.0.0.1:'+server.address().port;
 async function login(usuario){const r=await fetch(base+'/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({usuario,password})});assert.equal(r.status,200);return r.headers.get('set-cookie').split(';')[0];}
@@ -28,14 +40,25 @@ try{
  assert.equal((await pool.query('SELECT key FROM shared_records WHERE key=$1',['speech_analytic_entel_no_venta_v1'])).rowCount,0);
  assert.equal((await send(cookie,{commit:true})).status,400);
  const committed=await send(cookie,{commit:true,allowUnmatched:true});assert.equal(committed.status,200);
+ assert.equal(committed.data.evaluationCount,30);assert.equal(committed.data.feedbackCount,30);
  const duplicate=await send(cookie,{commit:true,allowUnmatched:true});assert.equal(duplicate.data.newCount,0);assert.equal(duplicate.data.duplicates,30);
  const changed=rows.map((r,i)=>i? r:{...r,Asesor:'Changed'});assert.equal((await send(cookie,{rows:changed,commit:true,allowUnmatched:true})).status,400);
  const reader=await login('reader');const data=await(await fetch(base+'/api/speech-analytics',{headers:{cookie:reader}})).json();assert.equal(data.records.length,30);
  const stats=globalThis.SpeechModel.summary(data.records);assert.equal(stats.advisors.length,18);assert.ok(Math.abs(stats.average-73.14)<0.001);assert.equal(stats.critical,2);assert.equal(stats.passed,2);
  assert.equal((await send(reader,{commit:true,allowUnmatched:true})).status,403);
  const other=await login('other');assert.equal((await fetch(base+'/api/speech-analytics',{headers:{cookie:other}})).status,403);
- for(const key of ['evaluations_v1','feedback_records_v2','sales_validations_v1','staffing'])assert.equal((await pool.query('SELECT value FROM shared_records WHERE key=$1',[key])).rows[0].value,'[]');
- console.log(JSON.stringify({ok:true,preview:30,imported:data.records.length,advisors:stats.advisors.length,average:stats.average,critical:stats.critical,duplicatesSkipped:30,operationalDataUntouched:true,permissions:'PASS'}));
+ for(const key of ['sales_validations_v1','staffing'])assert.equal((await pool.query('SELECT value FROM shared_records WHERE key=$1',[key])).rows[0].value,'[]');
+ const evaluationRows=JSON.parse((await pool.query('SELECT value FROM shared_records WHERE key=$1',['evaluations_v1'])).rows[0].value);
+ const feedbackRows=JSON.parse((await pool.query('SELECT value FROM shared_records WHERE key=$1',['feedback_records_v2'])).rows[0].value);
+ assert.equal(evaluationRows.length,30);assert.equal(feedbackRows.length,30);assert.equal(new Set(evaluationRows.map(r=>r.saImportId)).size,1);
+ for(const e of evaluationRows){assert.equal(e.auditorId,'admin');assert.equal(e.source,'speech_analytic');assert.equal(e.pendingAdvisorCreation,true);assert.ok(feedbackRows.some(f=>f.id===e.feedbackId&&f.sourceEvaluationId===e.id));}
+ const retries=await Promise.all([send(cookie,{commit:true,allowUnmatched:true}),send(cookie,{commit:true,allowUnmatched:true})]);assert.ok(retries.every(r=>r.data.evaluationCount===0));
+ await pool.query("ALTER TABLE pg_temp.shared_records ADD CONSTRAINT reject_new_evaluations CHECK (key NOT LIKE 'evaluation_record_%') NOT VALID");
+ const failed=await send(cookie,{rows:[{...rows[0],ID:'rollback-test',Archivo:'rollback-test.mp3'}],commit:true,allowUnmatched:true});assert.equal(failed.status,500);
+ assert.equal(JSON.parse((await pool.query('SELECT value FROM shared_records WHERE key=$1',['evaluations_v1'])).rows[0].value).length,30);
+ assert.equal(JSON.parse((await pool.query('SELECT value FROM shared_records WHERE key=$1',['speech_analytic_entel_no_venta_v1'])).rows[0].value).records.length,30);
+ await pool.query('ALTER TABLE pg_temp.shared_records DROP CONSTRAINT reject_new_evaluations');
+ console.log(JSON.stringify({ok:true,preview:30,imported:data.records.length,evaluations:evaluationRows.length,feedbacks:feedbackRows.length,advisors:stats.advisors.length,average:stats.average,critical:stats.critical,duplicatesSkipped:30,permissions:'PASS'}));
  if(process.argv.includes('--browser')){
   const {createRequire}=await import('node:module');const require=createRequire(import.meta.url);
   const {chromium}=require(process.env.CODEX_NODE_MODULES+'/playwright');
@@ -66,8 +89,27 @@ try{
    await page.setViewportSize({width:390,height:844});
    await page.screenshot({path:'reference/speech/dashboard-mobile.png',fullPage:true});
    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1),'Page overflows horizontally');
+   await page.setViewportSize({width:1440,height:1000});await page.goto(base+'/test-evaluations');
+   await page.getByText('Cargas Speech analytic',{exact:true}).waitFor();
+   assert.equal(await page.evaluate(()=>window.testDataset.feedbackRows.length),30);
+   assert.equal(await page.evaluate(()=>window.testDataset.feedbackRows.filter(r=>r.sourceType==='evaluation').length),30);
+   await page.getByRole('button',{name:/SA · 30/}).click();
+   assert.equal(await page.getByRole('button',{name:'ABRIR',exact:true}).count(),30);
+   await page.screenshot({path:'reference/speech/evaluation-folder.png',fullPage:true});
+   await page.getByRole('button',{name:'ABRIR',exact:true}).first().click();
+   await page.getByText(/SA · Speech analytic/).waitFor();
+   await page.getByText(/Nota PUE provisional/).waitFor();
+   await page.screenshot({path:'reference/speech/evaluation-detail.png',fullPage:false});
    assert.deepEqual(errors,[]);
    console.log('Browser PASS: actual Excel preview, duplicate prevention, date filter, detail, both tabs, desktop and mobile without overflow or JS errors.');
   }finally{await browser.close();}
  }
+ const {gasHandlers,invalidateFirebaseCache}=await import('../server/gasHandlers.js');
+ const advisor={usuario:'test.advisor',nombre:'Test Advisor',rol:'asesor'};
+ await assert.rejects(()=>gasHandlers.updateFeedbackRecord({id:feedbackRows[0].id,action:'submit_response_and_accept',responseText:'Mi compromiso',currentUser:advisor}),/permisos/);
+ feedbackRows[0]={...feedbackRows[0],pendingAdvisorCreation:false,advisorUser:advisor.usuario};
+ await pool.query('UPDATE shared_records SET value=$2 WHERE key=$1',['feedback_records_v2',JSON.stringify(feedbackRows)]);invalidateFirebaseCache('feedback_records_v2');
+ const accepted=await gasHandlers.updateFeedbackRecord({id:feedbackRows[0].id,action:'submit_response_and_accept',responseText:'Mi compromiso',currentUser:advisor});assert.equal(accepted.managementStatus,'advisor_accepted');
+ const completed=await gasHandlers.updateFeedbackRecord({id:feedbackRows[0].id,action:'mark_realized',currentUser:users[0]});assert.equal(completed.managementStatus,'feedback_completed');assert.ok(completed.managedAt);
+ console.log('Feedback PASS: pending user cannot accept, linked advisor accepts, admin completes with management timestamp.');
 }finally{await new Promise(r=>server.close(r));await pool.query('DROP TABLE IF EXISTS pg_temp.shared_records');await closePostgresPool();}

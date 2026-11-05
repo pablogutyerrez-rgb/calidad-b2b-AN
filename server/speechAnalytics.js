@@ -2,6 +2,8 @@ import '../public/speech-model.js';
 import {randomUUID} from 'node:crypto';
 import {getPostgresPool,ensurePostgresSchema} from './postgres.js';
 import {getDatabaseBackend} from './database.js';
+import {buildSpeechEvaluation,speechEvaluationId,resolveSpeechAdvisor} from './speechEvaluations.js';
+import {buildEvaluationIndexRecord,invalidateFirebaseCache,withSpeechEvaluationWriteLock} from './gasHandlers.js';
 
 const model=globalThis.SpeechModel;
 const dataKey='speech_analytic_entel_no_venta_v1';
@@ -14,6 +16,9 @@ export async function listSpeech(user){
   return decode(result.rows[0]);
 }
 export async function importSpeech(user,payload){
+  return withSpeechEvaluationWriteLock(()=>importSpeechTransaction(user,payload));
+}
+async function importSpeechTransaction(user,payload){
   authorize(user,true);
   if(payload?.kind!=='no_venta')fail('La plantilla de Validacion de venta aun no esta configurada.');
   const parsed=model.parseRows(payload.rows);
@@ -23,19 +28,32 @@ export async function importSpeech(user,payload){
     await db.query('BEGIN');await db.query('SELECT pg_advisory_xact_lock(782632)');
     const current=decode((await db.query('SELECT value FROM shared_records WHERE key=$1 FOR UPDATE',[dataKey])).rows[0]);
     const plan=model.planImport(parsed.rows,current.records);
-    const staffingRow=(await db.query('SELECT value FROM shared_records WHERE key=$1',['staffing'])).rows[0];
-    const staffing=staffingRow?JSON.parse(staffingRow.value):[];
-    const names=new Set(staffing.filter(s=>(s.clientId||s.platformId||'entel_b2b')==='entel_b2b').map(s=>model.norm(s.asesor)));
-    const unmatched=[...new Set(parsed.rows.filter(r=>!names.has(model.norm(r.advisor))).map(r=>r.advisor))];
+    const read=async key=>{const result=await db.query('SELECT value FROM shared_records WHERE key=$1 FOR UPDATE',[key]);return result.rows[0]?JSON.parse(result.rows[0].value):[];};
+    const staffing=await read('staffing'),users=await read('users_v1');
+    const evaluations=await read('evaluations_v1'),feedbacks=await read('feedback_records_v2'),deleted=await read('deleted_evaluations_v1');
+    const occupied=new Set([...evaluations,...deleted].map(e=>String(e?.id||e?.idEvaluacion||e)));
+    const candidates=model.uniqueCalls(parsed.rows).filter(r=>!occupied.has(speechEvaluationId(r)));
+    const unmatched=[...new Set(candidates.filter(r=>resolveSpeechAdvisor(r,staffing,users).pending).map(r=>r.advisor))];
+    const batch={id:randomUUID(),file:String(payload.file||'Importacion Excel').slice(0,250),createdAt:new Date().toISOString(),createdBy:user.usuario,count:plan.added.length,duplicates:plan.duplicates.length};
+    const generated=candidates.map(row=>buildSpeechEvaluation({row,user,staffing,users,batch,now:batch.createdAt}));
+    const feedbackIds=new Set(feedbacks.map(f=>String(f.id)));
+    for(const {feedback} of generated)if(feedback){if(feedbackIds.has(String(feedback.id)))fail('Conflicto de identificador de feedback; no se guardo la carga.');feedbackIds.add(String(feedback.id));}
     const report={total:payload.rows.length,valid:parsed.rows.length,newCount:plan.added.length,duplicates:plan.duplicates.length,conflicts:plan.conflicts,errors:parsed.errors,unmatched,warnings:parsed.rows.flatMap(r=>r.warnings.map(message=>({row:r.row,message}))),sample:plan.added.slice(0,5)};
+    Object.assign(report,{evaluationCount:generated.length,feedbackCount:generated.filter(g=>g.feedback).length,pendingCriteria:[...new Set(generated.flatMap(g=>g.evaluation.saPendingCriteria))]});
     if(payload.commit!==true){await db.query('ROLLBACK');return {...report,committed:false};}
     if(parsed.errors.length||plan.conflicts.length)fail('Corrige filas invalidas o conflictos antes de importar.');
     if(unmatched.length&&!payload.allowUnmatched)fail('Confirma los asesores sin coincidencia en Dotacion.');
-    if(!plan.added.length){await db.query('ROLLBACK');return {...report,committed:true};}
-    const batch={id:randomUUID(),file:String(payload.file||'Importacion Excel').slice(0,250),createdAt:new Date().toISOString(),createdBy:user.usuario,count:plan.added.length,duplicates:plan.duplicates.length};
+    if(!plan.added.length&&!generated.length){await db.query('ROLLBACK');return {...report,committed:true};}
+    batch.evaluationCount=generated.length;batch.feedbackCount=report.feedbackCount;
     const next={records:[...current.records,...plan.added.map(r=>({...r,importId:batch.id,importedAt:batch.createdAt,importedBy:user.usuario,clientId:'entel_b2b'}))],imports:[batch,...current.imports]};
+    const write=async(key,value)=>db.query('INSERT INTO shared_records(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()',[key,JSON.stringify(value)]);
+    if(generated.length){
+      for(const {evaluation} of generated)await write('evaluation_record_'+evaluation.id,evaluation);
+      await write('evaluations_v1',[...generated.map(g=>buildEvaluationIndexRecord(g.evaluation)),...evaluations]);
+      if(report.feedbackCount)await write('feedback_records_v2',[...generated.map(g=>g.feedback).filter(Boolean),...feedbacks]);
+    }
     await db.query('INSERT INTO shared_records(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()',[dataKey,JSON.stringify(next)]);
-    await db.query('COMMIT');return {...report,committed:true};
+    await db.query('COMMIT');invalidateFirebaseCache('evaluations_v1','feedback_records_v2',...generated.map(g=>'evaluation_record_'+g.evaluation.id));return {...report,committed:true};
   }catch(e){await db.query('ROLLBACK');throw e;}finally{db.release();}
 }
 export function installSpeechRoutes(app){
